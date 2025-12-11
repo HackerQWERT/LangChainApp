@@ -1,0 +1,112 @@
+{
+    "supervisor": {
+        "messages": [
+            {
+                "type": "human",
+                "content": "帮我预订从北京到上海的机票",
+                "id": "710787bb-7dc5-4350-8001-96296158fd79"
+            },
+            {
+                "type": "ai",
+                "name": "supervisor",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_fobq8KUDNejUwZ4T0LBAMTPJ",
+                        "function": {
+                            "arguments": "{}",
+                            "name": "transfer_to_booking_team"
+                        },
+                        "type": "function"
+                    }
+                ],
+                "response_metadata": {
+                    "token_usage": {
+                        "completion_tokens": 918,
+                        "prompt_tokens": 382,
+                        "total_tokens": 1300
+                    },
+                    "model_name": "gpt-5-2025-08-07",
+                    "finish_reason": "tool_calls"
+                },
+                "id": "run--b16d800c-b753-475f-a117-c104dfebd77a-0"
+            },
+            {
+                "type": "tool",
+                "content": "Successfully transferred to booking_team",
+                "name": "transfer_to_booking_team",
+                "tool_call_id": "call_fobq8KUDNejUwZ4T0LBAMTPJ",
+                "id": "3319fdb4-32a0-435a-9437-0c589c14635c"
+            },
+            {
+                "type": "ai",
+                "name": "supervisor",
+                "content": "我已为您对接机票代理。为尽快为您确认北京至上海的机票，请您提供以下信息：\n\n- 出发日期与时间偏好（具体日期；上午/下午/晚上）\n- 出发/到达机场：北京首都PEK或大兴PKX；上海虹桥SHA或浦东PVG\n- 是否单程还是往返；如往返请提供返程日期与时间偏好\n- 乘客信息：每位乘客姓名（拼音）、证件类型及号码（身份证/护照）、出生日期\n- 舱位偏好：经济舱/高端经济/公务舱/头等舱\n- 航班偏好：是否要求直飞；是否偏好某家航空公司（如国航CA、东航MU、吉祥HO等）\n- 行李需求：是否需要托运行李及件数\n- 座位偏好：靠窗/靠过道/不限\n- 预算范围与是否可接受更便宜但时间更长的方案\n- 日期是否可灵活（例如可接受±1天）\n- 联系方式：用于接收确认与电子行程单（邮箱或手机号）\n- 是否需要报销发票（如需请提供抬头与税号）\n\n如果您暂时不确定，我可以按常见偏好先为您查询并锁定座位：1名成人、经济舱、直飞、北京首都PEK至上海虹桥SHA、最早可出发、无托运行李。您看这样是否合适？如果可以，请告知出发日期。",
+                "response_metadata": {
+                    "token_usage": {
+                        "completion_tokens": 1004,
+                        "prompt_tokens": 709,
+                        "total_tokens": 1713
+                    },
+                    "model_name": "gpt-5-2025-08-07"
+                },
+                "id": "run--658bc84c-0760-49d7-bb0d-d1f184e27b24-0"
+            },
+            {
+                "type": "ai",
+                "name": "booking_team",
+                "content": "Transferring back to supervisor",
+                "tool_calls": [
+                    {
+                        "name": "transfer_back_to_supervisor",
+                        "args": {},
+                        "id": "45d82b83-28ff-4c10-a8c8-631bf760649d",
+                        "type": "tool_call"
+                    }
+                ],
+                "response_metadata": {
+                    "__is_handoff_back": true
+                },
+                "id": "e7b4d60f-95fe-4e96-9c92-0615cf163e52"
+            },
+            {
+                "type": "tool",
+                "content": "Successfully transferred back to supervisor",
+                "name": "transfer_back_to_supervisor",
+                "tool_call_id": "45d82b83-28ff-4c10-a8c8-631bf760649d",
+                "id": "c233a0f8-efa1-419a-a6f8-96a1941c7415"
+            },
+            {
+                "type": "ai",
+                "name": "supervisor",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_7BXIApsqPf0ct6pDxUNYJjt7",
+                        "function": {
+                            "arguments": "{}",
+                            "name": "transfer_to_booking_team"
+                        },
+                        "type": "function"
+                    }
+                ],
+                "response_metadata": {
+                    "token_usage": {
+                        "completion_tokens": 1430,
+                        "prompt_tokens": 835,
+                        "total_tokens": 2265
+                    },
+                    "model_name": "gpt-5-2025-08-07"
+                },
+                "id": "run--de34bbf2-ceef-4ed8-8faf-b7f782db871d-0"
+            },
+            {
+                "type": "tool",
+                "content": "Successfully transferred to booking_team",
+                "name": "transfer_to_booking_team",
+                "tool_call_id": "call_7BXIApsqPf0ct6pDxUNYJjt7",
+                "id": "86fb4be0-364f-4c50-aff5-ebfdd070da1a"
+            }
+        ]
+    }
+}
