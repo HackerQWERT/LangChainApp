@@ -1,10 +1,16 @@
-from . import project_root
-from langchain_core.messages import HumanMessage
 import asyncio
-from app.infras.agent.travel_agent import graph_app  # 导入你的图实例
+import os
+import sys
+from langchain_core.messages import HumanMessage
+
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 
 async def run_interactive():
+    # 注意：这里根据你的实际目录结构可能需要调整 import
+    # 假设你的 production_agent.py 在 app.infras.agent.travel_agent
+    from app.infras.agent.travel_agent import graph_app
+
     # 允许用户自定义 ID，方便测试记忆功能
     thread_id = input("请输入模拟 User ID (回车默认 'user_001'): ") or "user_001"
     config = {"configurable": {"thread_id": thread_id}}
@@ -32,7 +38,7 @@ async def run_interactive():
                 print("\n[系统]: 收到支付回调，恢复执行...")
                 # 恢复执行：传入 None 继续
                 async for event in graph_app.astream(None, config):
-                    pass  # 节点内部有 print，这里仅驱动
+                    _print_event_message(event)
                 continue
             else:
                 print("[系统]: ⚠️  模拟器限制：请先输入 'pay' 完成流程。")
@@ -44,17 +50,27 @@ async def run_interactive():
             break
 
         # 3. 发送给 Agent
-        # print("Agent: ", end="", flush=True) # 节点内部已有详细 print，这里不再重复
-
-        # 使用 astream 驱动图运行
+        # 这里移除了 pass，改为解析并打印 event
         async for event in graph_app.astream({"messages": [HumanMessage(content=user_input)]}, config):
-            pass
+            _print_event_message(event)
 
         # 4. 打印当前状态快照 (Debug)
         snapshot = graph_app.get_state(config)
         step = snapshot.values.get('step')
         dest = snapshot.values.get('destination')
         print(f"   🛠️ [State]: Step={step}, Dest={dest}")
+
+
+def _print_event_message(event):
+    """辅助函数：从 LangGraph 事件中提取并打印 AI 回复"""
+    for node_name, values in event.items():
+        # values 是节点返回的字典，通常包含 'messages'
+        if "messages" in values and values["messages"]:
+            last_msg = values["messages"][-1]
+            if hasattr(last_msg, "content") and last_msg.content:
+                # 打印 AI 的回复内容
+                print(f"\nAgent: {last_msg.content}")
+
 
 if __name__ == "__main__":
     try:

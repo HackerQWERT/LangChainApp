@@ -1,11 +1,22 @@
+import os
+import json
 from app.infras.db import AsyncDatabaseManager, async_insert_flight, async_insert_hotel, async_get_flights, async_get_hotels
 from langchain.tools import tool
 from app.infras.third_api import fetch_weather_report
 from datetime import datetime
-
 from app.infras.third_api.tavily import tavily_search
 
-# --- 现有数据库 Tools (保持不变) ---
+# 尝试导入依赖，如果未安装则设置为空，防止报错但会提示用户安装
+try:
+    from serpapi import GoogleSearch
+except ImportError:
+    GoogleSearch = None
+
+# --- 引入新拆分的专业航班工具 ---
+
+# =============================================================================
+# 数据库交互 Tools (保持不变)
+# =============================================================================
 
 
 @tool
@@ -81,7 +92,9 @@ async def book_ticket(attraction_name: str, date: str):
     return f"Successfully booked a ticket for {attraction_name} on {date}."
 
 
-# --- 真实天气实现 ---
+# =============================================================================
+# 第三方 API Tools (天气 & 通用搜索)
+# =============================================================================
 
 @tool
 async def get_weather(location: str, date: str = None):
@@ -104,23 +117,9 @@ async def search_travel_guides(query: str):
 
 
 @tool
-async def search_flights(origin: str, destination: str, date: str):
-    """
-    查询实际航班信息。
-    Args:
-        origin: 出发地
-        destination: 目的地
-        date: 出发日期
-    """
-    query = f"flights from {origin} to {destination} on {date}"
-    print(f"调用查询航班: {query}")
-    return await tavily_search(query)
-
-
-@tool
 async def search_hotels(location: str, check_in: str, check_out: str):
     """
-    查询实际酒店信息。
+    查询实际酒店信息 (使用通用搜索)。
     Args:
         location: 地点
         check_in: 入住日期
@@ -134,7 +133,7 @@ async def search_hotels(location: str, check_in: str, check_out: str):
 @tool
 async def search_tickets(attraction: str, date: str):
     """
-    查询实际景点门票信息。
+    查询实际景点门票信息 (使用通用搜索)。
     Args:
         attraction: 景点名称
         date: 游玩日期
@@ -149,3 +148,137 @@ def get_current_time():
     """获取当前系统时间，格式为 YYYY-MM-DD HH:MM:SS"""
     print("调用获取当前时间")
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+# =============================================================================
+# 工具 1: 机场代码查询 (辅助工具)
+# 作用: 将用户口语的 "Beijing", "New York" 转换为 IATA 代码 "PEK", "JFK"
+# =============================================================================
+
+
+@tool
+def lookup_airport_code(city_name: str):
+    """
+    Look up the IATA airport code for a given city name. 
+    Essential for flight searches.
+    Args:
+        city_name: The name of the city (e.g., "Beijing", "New York", "London")
+    """
+    print(f"🔍 [Tool] Searching airport code for: {city_name}")
+
+    # 常用机场映射表 (建议实际生产中替换为数据库查询或专用 API)
+    mapping = {
+        "Beijing": "PEK", "Shanghai": "PVG", "Guangzhou": "CAN", "Shenzhen": "SZX",
+        "New York": "JFK", "Los Angeles": "LAX", "San Francisco": "SFO",
+        "London": "LHR", "Tokyo": "HND", "Paris": "CDG", "Singapore": "SIN",
+        "Dubai": "DXB", "Sydney": "SYD", "Hong Kong": "HKG"
+    }
+
+    # 简单的模糊匹配处理
+    for city, code in mapping.items():
+        if city.lower() in city_name.lower():
+            return code
+
+    # 如果没找到，可以返回提示让 Agent 尝试其他名字，或者这里可以 fallback 到通用搜索
+    return f"IATA code for '{city_name}' not found in local cache. Please try major city names (e.g., 'Tokyo' instead of 'Shinjuku')."
+
+
+# =============================================================================
+# 工具 2: 航班搜索 (核心工具)
+# 实现: SerpApi (Google Flights 引擎)
+# =============================================================================
+
+@tool
+def search_flights(origin: str, destination: str, date: str):
+    """
+    Search for real-time flight tickets using Google Flights engine.
+    Returns structured data including airline, flight number, time, and price.
+
+    Args:
+        origin: Departure airport IATA code (e.g., "PEK", "JFK") - NOT city name.
+        destination: Arrival airport IATA code (e.g., "HND", "LHR") - NOT city name.
+        date: Departure date in "YYYY-MM-DD" format.
+    """
+    if not GoogleSearch:
+        return "System Error: 'google-search-results' library is missing. Please install it."
+
+    api_key = os.getenv("SERPAPI_API_KEY")
+    if not api_key:
+        return "System Error: SERPAPI_API_KEY environment variable is missing."
+
+    print(f"✈️ [Tool] Searching flights: {origin} -> {destination} on {date}")
+
+    params = {
+        "engine": "google_flights",
+        "departure_id": origin,
+        "arrival_id": destination,
+        "outbound_date": date,
+        "currency": "CNY",  # 默认货币，可按需修改
+        "hl": "zh-cn",      # 语言设置
+        "api_key": api_key
+    }
+
+    try:
+        search = GoogleSearch(params)
+        results = search.get_dict()
+
+        # 提取 'best_flights' (性价比最高的) 或 'other_flights'
+        flight_results = results.get("best_flights", [])
+        if not flight_results:
+            flight_results = results.get("other_flights", [])
+
+        if not flight_results:
+            return f"No flights found from {origin} to {destination} on {date}."
+
+        parsed_flights = []
+        # 限制返回数量为 5 条，避免 Token 消耗过大
+        for flight in flight_results[:5]:
+            # Google Flights 数据结构解析
+            flight_info = flight.get("flights", [{}])[0]
+
+            # 安全获取时间
+            dep_time = flight_info.get(
+                "departure_airport", {}).get("time", "N/A")
+            arr_time = flight_info.get(
+                "arrival_airport", {}).get("time", "N/A")
+
+            item = {
+                "airline": flight_info.get("airline"),
+                "flight_number": flight_info.get("flight_number"),
+                "departure": f"{origin} at {dep_time}",
+                "arrival": f"{destination} at {arr_time}",
+                "duration": f"{flight.get('total_duration')} min",
+                "price": f"¥{flight.get('price', 'Unknown')}",
+                "link": flight.get("google_flights_url")  # 提供链接方便用户核实
+            }
+            parsed_flights.append(item)
+
+        return json.dumps(parsed_flights, ensure_ascii=False)
+
+    except Exception as e:
+        return f"API Error during flight search: {str(e)}"
+
+
+# =============================================================================
+# 导出工具列表
+# =============================================================================
+# 这是一个便捷列表，Agent 可以直接 import tools from app.tools.tools
+tools = [
+    # 航班相关 (来自 app.tools.flight)
+    lookup_airport_code,
+    search_flights,
+
+    # 数据库预订相关
+    book_hotel,
+    book_flight,
+    book_ticket,
+    query_booked_flights,
+    query_booked_hotels,
+
+    # 信息查询相关
+    get_weather,
+    search_travel_guides,
+    search_hotels,
+    search_tickets,
+    get_current_time
+]

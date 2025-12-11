@@ -31,6 +31,8 @@ dependencies = [
     "scalar-fastapi>=1.0.6",
     "langchain-google-vertexai>=0.0.1",
     "tavily-python>=0.7.14",
+    "langsmith>=0.3.45",
+    "google-search-results>=2.4.2",
 ]
 
 [dependency-groups]

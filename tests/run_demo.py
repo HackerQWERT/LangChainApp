@@ -1,12 +1,14 @@
-# Add project root to Python path
 import os
 import sys
-from . import project_root
-from langchain_core.messages import HumanMessage
-from app.infras.agent import graph_app
+
+# Add project root to Python path
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
 
 async def run_demo():
+    from app.infras.agent.travel_agent import graph_app
+    from langchain_core.messages import HumanMessage
+
     # 线程 ID (模拟用户 Session)
     config = {"configurable": {"thread_id": "user_vip_001"}}
 
