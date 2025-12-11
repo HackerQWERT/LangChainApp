@@ -1,8 +1,9 @@
+# Add project root to Python path
+import os
+import sys
+from . import project_root
 from langchain_core.messages import HumanMessage
 from app.infras.agent import graph_app
-import sys
-import os
-sys.path.append(os.path.dirname(os.path.dirname(__file__)))
 
 
 async def run_demo():

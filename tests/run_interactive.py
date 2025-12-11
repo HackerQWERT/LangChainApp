@@ -1,5 +1,7 @@
-from app.infras.agent import graph_app as app
+from . import project_root
 from langchain_core.messages import HumanMessage
+import asyncio
+from app.infras.agent.travel_agent import graph_app  # 导入你的图实例
 
 
 async def run_interactive():
@@ -15,7 +17,7 @@ async def run_interactive():
 
     while True:
         # 1. 检查是否处于中断状态 (Wait Payment)
-        snapshot = app.get_state(config)
+        snapshot = graph_app.get_state(config)
         next_steps = snapshot.next if hasattr(snapshot, 'next') else []
 
         if next_steps and "wait_payment" in next_steps:
@@ -29,7 +31,7 @@ async def run_interactive():
             if user_input.lower() == "pay":
                 print("\n[系统]: 收到支付回调，恢复执行...")
                 # 恢复执行：传入 None 继续
-                async for event in app.astream(None, config):
+                async for event in graph_app.astream(None, config):
                     pass  # 节点内部有 print，这里仅驱动
                 continue
             else:
@@ -45,17 +47,17 @@ async def run_interactive():
         # print("Agent: ", end="", flush=True) # 节点内部已有详细 print，这里不再重复
 
         # 使用 astream 驱动图运行
-        async for event in app.astream({"messages": [HumanMessage(content=user_input)]}, config):
+        async for event in graph_app.astream({"messages": [HumanMessage(content=user_input)]}, config):
             pass
 
         # 4. 打印当前状态快照 (Debug)
-        snapshot = app.get_state(config)
+        snapshot = graph_app.get_state(config)
         step = snapshot.values.get('step')
         dest = snapshot.values.get('destination')
-        # 如果最后一条消息是 Agent 发的，且没在节点里打印（防止漏打），可以在这里补
-        # 但目前的节点设计都包含了 print，所以这里只打 Debug 状态
         print(f"   🛠️ [State]: Step={step}, Dest={dest}")
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(run_interactive())
+    try:
+        asyncio.run(run_interactive())
+    except KeyboardInterrupt:
+        print("\n\n程序已退出。")

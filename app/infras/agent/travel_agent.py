@@ -12,7 +12,6 @@ from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver  # 生产环境换成 PostgresSaver
 
-# 导入你的工具 (假设在 my_tools.py)
 from app.infras.func import (
     search_flights, search_hotels, book_flight, book_hotel,
     get_weather, search_travel_guides
@@ -70,9 +69,7 @@ class RouterOutput(BaseModel):
 async def intent_router_node(state: TravelState):
     """
     守门员节点：分析用户最新一句话的意图。
-    - continue: 顺着主流程往下走 (补充信息、确认方案)
-    - modify: 想要修改已经确定的需求 (改目的地、改时间)
-    - side_chat: 闲聊 (天气、签证、甚至问你是谁)
+    核心升级：增加了对“当前步骤是否支持该操作”的判断。
     """
     # 增加安全性检查：确保 messages 不为空
     if not state.get("messages"):
@@ -81,19 +78,32 @@ async def intent_router_node(state: TravelState):
     last_msg = state["messages"][-1].content
     current_step = state.get("step", "collect")
 
-    # 如果处于等待支付状态，特殊处理：
-    # 除非用户明确说“不买了”或“改需求”，否则视为 continue (可能是在问支付问题)
+    # 如果处于等待支付状态，特殊处理
     if current_step == "wait_payment":
-        pass  # 继续走通用逻辑，但 Prompt 可以微调
+        pass
 
     router_prompt = f"""
-    你是一个意图分类器。用户当前处于旅行规划的 "{current_step}" 阶段。
+    你是一个严格的意图分类器。用户当前处于旅行规划的 "{current_step}" 阶段。
     用户最新输入是: "{last_msg}"
 
-    请分析用户意图并输出 JSON:
-    - "modify": 如果用户明确想要改变目的地、时间、预算等核心条件 (如: "换个时间", "去泰国吧", "预算不够")。
-    - "side_chat": 如果用户问天气、攻略、或者与当前规划步骤无关的问题。
-    - "continue": 如果用户是在回答系统的问题、确认方案、选择方案、推进流程，或者在支付阶段询问支付相关问题。
+    请根据当前步骤判断用户意图，并输出 JSON：
+
+    1. "modify": 用户明确想要改变目的地、时间、预算等核心条件。
+    
+    2. "side_chat": 
+       - 用户问天气、攻略等无关问题。
+       - **关键规则**：如果用户试图执行当前步骤无法完成的操作（例如在 "collect" 阶段就说 "选方案1"，或者在 "plan" 阶段还没出结果就说 "支付"），这属于无效操作，必须归类为 "side_chat"，以便系统解释并引导。
+    
+    3. "continue": 
+       - 用户正在回答当前步骤的问题（例如在 "collect" 回答预算）。
+       - 用户在 "review" 阶段选择方案。
+       - 用户在 "wait_payment" 阶段询问支付细节。
+
+    当前步骤 "{current_step}" 的有效操作定义：
+    - collect: 提供/补充 目的地、时间、预算。
+    - plan: 等待生成（通常此时不会有用户输入，如果有，通常是 modify 或 side_chat）。
+    - review: 选择具体的方案（如“方案1”，“第二个”）。
+    - wait_payment: 确认支付或询问支付状态。
 
     输出格式: {{ "decision": "...", "reason": "..." }}
     """
@@ -164,9 +174,6 @@ async def generate_plans_node(state: TravelState):
     print("💡 [Node] Generating Plans...")
 
     reqs = f"从 {state.get('origin', '未知')} 去 {state.get('destination', '未知')}, 时间 {state.get('dates', '待定')}, 预算 {state.get('budget', '待定')}"
-
-    # 在这里可以先调用 Search Tools 获取真实航班价格，作为 context 传给 LLM
-    # 为了演示简洁，直接让 LLM 生成结构化方案
 
     prompt = f"""
     基于需求: {reqs}
@@ -246,8 +253,6 @@ async def execute_booking_node(state: TravelState):
     dest = state.get("destination", "未知目的地")
     origin = state.get("origin", "未知出发地")
 
-    # 这里调用你真实的 Tools，确保传参正确
-    # 注意：假设 book_flight 接受 from_airport/to_airport，book_hotel 接受 hotel_name
     try:
         flight_res = await book_flight.ainvoke({
             "from_airport": origin,
@@ -267,22 +272,35 @@ async def execute_booking_node(state: TravelState):
         "messages": [AIMessage(content=f"{result_summary}\n\n[系统] 订单已创建，请点击链接支付...")]
     }
 
-# 节点 E: 侧轨 - 闲聊/问询 (Side Chat)
+# 节点 E: 侧轨 - 闲聊/问询/无效操作处理 (Side Chat)
 
 
 async def side_chat_node(state: TravelState):
-    print("💬 [Node] Side Chat (RAG/Weather)...")
+    print("💬 [Node] Side Chat (RAG/Weather/Invalid Action)...")
     last_msg = state["messages"][-1].content
+    current_step = state.get("step", "collect")
 
     # 这里可以调用 get_weather 或 search_travel_guides
     if "天气" in last_msg:
         weather = await get_weather.ainvoke({"location": state.get("destination", "北京")})
         reply = f"当地天气如下：{weather}"
     else:
-        # 普通闲聊
+        # 升级 Prompt：让 Side Chat 能够处理“无效操作”的解释
+        system_prompt = f"""
+        你是一个旅行助手。用户当前处于 "{current_step}" 步骤。
+        
+        用户的输入可能是：
+        1. 闲聊或询问天气、攻略等（与流程无关）。
+        2. 试图执行当前步骤无法完成的操作（例如在“collect”阶段就要求“选方案”或“支付”）。
+
+        对于情况 1：简短回答问题，并温柔地引导用户回到主流程。
+        对于情况 2：明确告知用户当前还不能这样做，解释原因，并引导用户完成当前步骤。
+
+        例如：如果在 collect 阶段用户说“选方案1”，你应该回：“我们还没生成方案呢。请先告诉我您的出发地和预算，我才能为您规划。”
+        """
+
         reply = await llm.ainvoke([
-            SystemMessage(
-                content="你是一个旅行助手。用户问了一个跟当前预订流程无关的问题，请简短回答，并引导用户回到主流程。"),
+            SystemMessage(content=system_prompt),
             HumanMessage(content=last_msg)
         ])
         reply = reply.content
@@ -290,7 +308,6 @@ async def side_chat_node(state: TravelState):
     return {"messages": [AIMessage(content=reply)]}
 
 # 节点 F: 侧轨 - 智能修改需求 (Smart Modify)
-# 改动核心：不再无脑重置到 collect，而是智能判断是否需要重算方案
 
 
 async def modify_req_node(state: TravelState):
@@ -349,7 +366,16 @@ async def modify_req_node(state: TravelState):
 
     return updates
 
+# 核心路由逻辑函数：modify 后的自动跳转逻辑
+
+
+def route_after_modify(state: TravelState):
+    if state.get("step") == "plan":
+        return "plan"  # 如果 modify 决定了重算，直接进 plan 节点
+    return END  # 否则结束等待用户
+
 # --- 4. 构建图 (Graph Construction) ---
+
 
 workflow = StateGraph(TravelState)
 
@@ -365,26 +391,23 @@ workflow.add_node("modify", modify_req_node)
 workflow.add_node("wait_payment", lambda x: {"messages": [
                   AIMessage(content="收到支付回调，继续处理...")]})
 
-# 设置入口：每次用户说话，先过 Router
+# 设置入口
 workflow.add_edge(START, "intent_router")
 
 # 核心路由逻辑函数
 
 
 def route_next_step(state: TravelState):
-    # 使用 .get() 设定默认值，防止 KeyError
     decision = state.get("router_decision", "continue")
     current_step = state.get("step", "collect")
 
-    # 1. 如果用户想修改，最高优先级
     if decision == "modify":
         return "modify"
 
-    # 2. 如果用户在闲聊，进侧轨
     if decision == "side_chat":
         return "side_chat"
 
-    # 3. 否则，继续主流程 (根据当前 step 决定去哪个节点)
+    # continue 走主流程
     return current_step
 
 
@@ -403,11 +426,18 @@ workflow.add_conditional_edges(
     }
 )
 
-# 侧轨执行完，回到 Router 等待下一次输入（或者直接结束等待用户新输入）
-# 注意：这里使用 END 是正确的。MemorySaver 会保存状态。
-# 下次用户说话时，Start -> Intent Router，此时 State 里的 Step 依然是原来的 Step。
+# modify 后的条件边
+workflow.add_conditional_edges(
+    "modify",
+    route_after_modify,
+    {
+        "plan": "plan",
+        END: END
+    }
+)
+
+# 侧轨执行完，回到 Router 等待下一次输入
 workflow.add_edge("side_chat", END)
-workflow.add_edge("modify", END)
 workflow.add_edge("collect", END)
 workflow.add_edge("review", END)
 
@@ -423,5 +453,5 @@ workflow.add_edge("wait_payment", END)
 memory = MemorySaver()
 graph_app = workflow.compile(
     checkpointer=memory,
-    interrupt_before=["wait_payment"]  # 关键修改：在进入支付等待前中断，模拟收银台模式
+    interrupt_before=["wait_payment"]
 )
