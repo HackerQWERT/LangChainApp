@@ -1,6 +1,6 @@
 import os
 import json
-from app.infras.db import AsyncDatabaseManager, async_insert_flight, async_insert_hotel, async_get_flights, async_get_hotels
+from app.infras.db import AsyncDatabaseManager, async_get_flights, async_get_hotels, async_lock_flight, async_confirm_flight, async_lock_hotel, async_confirm_hotel
 from langchain.tools import tool
 from app.infras.third_api import fetch_weather_report
 from datetime import datetime
@@ -19,41 +19,85 @@ except ImportError:
 # =============================================================================
 
 
+# =============================================================================
+# 数据库交互 Tools (保持不变)
+# =============================================================================
+
+
 @tool
-async def book_hotel(hotel_name: str):
-    """预订酒店"""
-    print(f"调用预订酒店: hotel_name={hotel_name}")
+async def lock_flight(flight_number: str, date: str, user_id: str = "default_user", from_airport: str = "Unknown", to_airport: str = "Unknown", passenger: str = "Unknown"):
+    """锁定机票订单"""
+    print(
+        f"调用锁定机票订单: flight_number={flight_number}, user_id={user_id}, from={from_airport}, to={to_airport}, date={date}, passenger={passenger}")
+    db_manager = AsyncDatabaseManager()
+    await db_manager.ping()
+    db = db_manager.get_db()
+    flight_data = {
+        "flight_number": flight_number,
+        "from": from_airport,
+        "to": to_airport,
+        "date": date,
+        "passenger": passenger
+    }
+    order_id = await async_lock_flight(db, flight_data, user_id)
+    await db_manager.close()
+    if order_id:
+        return str(order_id)
+    else:
+        raise Exception("Failed to lock flight order.")
+
+
+@tool
+async def lock_hotel(hotel_name: str, check_in: str, user_id: str = "default_user", location: str = "Unknown", check_out: str = "Unknown", guest: str = "Unknown"):
+    """锁定酒店订单"""
+    print(
+        f"调用锁定酒店订单: user_id={user_id}, hotel_name={hotel_name}, location={location}, check_in={check_in}, check_out={check_out}, guest={guest}")
     db_manager = AsyncDatabaseManager()
     await db_manager.ping()
     db = db_manager.get_db()
     hotel_data = {
         "name": hotel_name,
-        "location": "New York",
-        "check_in": "2025-11-01",
-        "check_out": "2025-11-03",
-        "guest": "John Doe"
+        "location": location,
+        "check_in": check_in,
+        "check_out": check_out,
+        "guest": guest
     }
-    await async_insert_hotel(db, hotel_data)
+    order_id = await async_lock_hotel(db, hotel_data, user_id)
     await db_manager.close()
-    return f"Successfully booked a stay at {hotel_name}."
+    if order_id:
+        return str(order_id)
+    else:
+        raise Exception("Failed to lock hotel order.")
 
 
 @tool
-async def book_flight(from_airport: str, to_airport: str):
-    """预订机票"""
-    print(f"调用预订机票: from={from_airport}, to={to_airport}")
+async def confirm_flight(order_id: str):
+    """确认机票订单"""
+    print(f"调用确认机票订单: order_id={order_id}")
     db_manager = AsyncDatabaseManager()
     await db_manager.ping()
     db = db_manager.get_db()
-    flight_data = {
-        "from": from_airport,
-        "to": to_airport,
-        "date": "2025-11-01",
-        "passenger": "John Doe"
-    }
-    await async_insert_flight(db, flight_data)
+    success = await async_confirm_flight(db, order_id)
     await db_manager.close()
-    return f"Successfully booked a flight from {from_airport} to {to_airport}."
+    if success:
+        return f"Successfully confirmed flight order {order_id}."
+    else:
+        return f"Failed to confirm flight order {order_id}."
+
+
+@tool
+async def confirm_hotel(order_id: str):
+    """确认酒店订单"""
+    print(f"调用确认酒店订单: order_id={order_id}")
+    db_manager = AsyncDatabaseManager()
+    await db_manager.ping()
+    db = db_manager.get_db()
+    success = await async_confirm_hotel(db, order_id)
+    await db_manager.close()
+    if success:
+        return f"Successfully confirmed hotel order {order_id}."
+    else:
+        return f"Failed to confirm hotel order {order_id}."
 
 
 @tool
@@ -234,17 +278,32 @@ def search_flights(origin: str, destination: str, date: str):
         # 限制返回数量为 5 条，避免 Token 消耗过大
         for flight in flight_results[:5]:
             # Google Flights 数据结构解析
-            flight_info = flight.get("flights", [{}])[0]
+            flights_segments = flight.get("flights", [])
+            if not flights_segments:
+                continue
+
+            first_segment = flights_segments[0]
+            last_segment = flights_segments[-1]
 
             # 安全获取时间
-            dep_time = flight_info.get(
+            dep_time = first_segment.get(
                 "departure_airport", {}).get("time", "N/A")
-            arr_time = flight_info.get(
+            arr_time = last_segment.get(
                 "arrival_airport", {}).get("time", "N/A")
 
+            # 收集所有航段的航班号
+            flight_numbers = [
+                f"{s.get('airline')} {s.get('flight_number')}" for s in flights_segments]
+            flight_number_str = ", ".join(flight_numbers)
+
+            # 收集所有航段的航空公司 (去重)
+            airlines = list(set([s.get("airline")
+                            for s in flights_segments if s.get("airline")]))
+            airline_str = ", ".join(airlines)
+
             item = {
-                "airline": flight_info.get("airline"),
-                "flight_number": flight_info.get("flight_number"),
+                "airline": airline_str,
+                "flight_number": flight_number_str,
                 "departure": f"{origin} at {dep_time}",
                 "arrival": f"{destination} at {arr_time}",
                 "duration": f"{flight.get('total_duration')} min",
@@ -257,28 +316,3 @@ def search_flights(origin: str, destination: str, date: str):
 
     except Exception as e:
         return f"API Error during flight search: {str(e)}"
-
-
-# =============================================================================
-# 导出工具列表
-# =============================================================================
-# 这是一个便捷列表，Agent 可以直接 import tools from app.tools.tools
-tools = [
-    # 航班相关 (来自 app.tools.flight)
-    lookup_airport_code,
-    search_flights,
-
-    # 数据库预订相关
-    book_hotel,
-    book_flight,
-    book_ticket,
-    query_booked_flights,
-    query_booked_hotels,
-
-    # 信息查询相关
-    get_weather,
-    search_travel_guides,
-    search_hotels,
-    search_tickets,
-    get_current_time
-]

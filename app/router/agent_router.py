@@ -1,16 +1,20 @@
 import uvicorn
-import json
-from fastapi import APIRouter, FastAPI, HTTPException
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
-from langchain_core.messages import HumanMessage, BaseMessage, trim_messages
-from langchain_core.messages import convert_to_messages
+from langchain_core.messages import HumanMessage, convert_to_messages
 from langgraph.types import Command
 
-# 修改为您的命名空间
-from app.infras.agent import travel_agent
+# 1. 导入业务 Agent
+from app.infras.agent.travel_agent import travel_agent
 
+# 2. 导入刚刚抽离的执行器逻辑
+from app.infras.agent import run_chat_stream
+
+# 定义 Router
 agent_router = APIRouter()
+
 # --- 请求模型 ---
 
 
@@ -29,81 +33,37 @@ class ChatRequest(BaseModel):
 @agent_router.post("/vibe/stream")
 async def vibe(req: ChatRequest):
     """
-    统一对话接口。
-    LangGraph 会根据 thread_id 自动加载历史记录，前端只需发送最新的增量消息即可。
+    统一对话接口 (API Layer)。
+    负责解析请求参数，并调用 runner 获取流式响应。
     """
 
-    # 1. 构造 LangGraph 的输入
-    config = {"configurable": {"thread_id": req.thread_id}}
-
+    # 1. 准备输入数据 (Input Payload)
     input_payload = {}
 
     if req.resume_action:
-        # A. 恢复模式：发送 Command
+        # A. 恢复模式
         input_payload = Command(resume=req.resume_action)
     elif req.messages:
-        # B. 列表模式：前端发送了标准的消息列表（例如 [{"role": "user", "content": "..."}]）
-        # 用于初始化或一次性发送多条指令
+        # B. 列表模式
         converted_msgs = convert_to_messages(req.messages)
         input_payload = {"messages": converted_msgs}
     elif req.message:
-        # C. 简单模式（最常用）：前端只发了最新的字符串
+        # C. 简单模式
         input_payload = {"messages": [HumanMessage(content=req.message)]}
     else:
         raise HTTPException(
             status_code=400, detail="Must provide message, messages, or resume_action")
 
-    # 2. 流式响应生成器
-    async def event_generator():
-        try:
-            # 使用 travel_agent 替代 app_graph
-            async for event in travel_agent.astream_events(
-                input_payload,
-                version="v2",
-                config=config
-            ):
-                kind = event["event"]
+    # 2. 准备配置 (Config)
+    config = {"configurable": {"thread_id": req.thread_id}}
 
-                # A. 捕获 LLM 的文本输出
-                if kind == "on_chat_model_stream":
-                    # 过滤掉 Supervisor 自身的输出，只显示 Worker 的
-                    if event.get("metadata", {}).get("langgraph_node") != "_supervisor":
-                        content = event["data"]["chunk"].content
-                        if content:
-                            # SSE 格式: data: {json}\n\n
-                            data = json.dumps(
-                                {"type": "delta", "content": content}, ensure_ascii=False)
-                            yield f"data: {data}\n\n"
+    # 3. 调用 Runner 获取生成器
+    # 这里我们将 logic 委托给了 agent_runner.py，Router 只负责网络层
+    stream_generator = run_chat_stream(
+        agent_graph=travel_agent,
+        input_payload=input_payload,
+        config=config
+    )
 
-                # B. 捕获工具调用 (可选显示)
-                elif kind == "on_tool_start":
-                    data = json.dumps(
-                        {"type": "tool", "name": event["name"]}, ensure_ascii=False)
-                    yield f"data: {data}\n\n"
-
-                # C. 捕获中断请求 (Interrupt)
-                # 注意：流式过程中很难捕捉到完整的中断 payload，通常在流结束后检查状态
-
-        except Exception as e:
-            data = json.dumps(
-                {"type": "error", "content": str(e)}, ensure_ascii=False)
-            yield f"data: {data}\n\n"
-
-        # 流结束后，检查是否处于中断状态
-        # 这是获取 "human_approval_node" 中 interrupt(msg) 内容的最佳时机
-        final_state = travel_agent.get_state(config)
-        if final_state.tasks and final_state.tasks[0].interrupts:
-            # 获取中断时传出来的数据 (就是 rules.py 里定义的 interrupt_msg)
-            interrupt_data = final_state.tasks[0].interrupts[0].value
-            data = json.dumps({
-                "type": "interrupt",
-                "payload": interrupt_data
-            }, ensure_ascii=False)
-            yield f"data: {data}\n\n"
-
-        # SSE 规范通常建议发送一个结束信号，方便客户端关闭连接（可选）
-        yield "data: [DONE]\n\n"
-
-    from fastapi.responses import StreamingResponse
-    # 修改 media_type 为 text/event-stream
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    # 4. 返回流式响应
+    return StreamingResponse(stream_generator, media_type="text/event-stream")

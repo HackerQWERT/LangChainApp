@@ -1,79 +1,57 @@
 import asyncio
-import os
 import sys
-from langchain_core.messages import HumanMessage
+import os
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# 1. 确保项目根目录在 sys.path 中
+sys.path.append(os.getcwd())
+
+try:
+    # 导入您的业务 Agent
+    from app.infras.agent.travel_agent import travel_agent
+    # 导入抽离的 Runner
+    from app.infras.agent import run_chat_stream
+except ImportError as e:
+    print(f"❌ 导入失败: {e}")
+    print("请确保以下文件存在:")
+    print("  - app/infras/agent/travel_agent.py")
+    print("  - app/infras/agent/__init__.py")
+    exit(1)
 
 
-async def run_interactive():
-    # 注意：这里根据你的实际目录结构可能需要调整 import
-    # 假设你的 production_agent.py 在 app.infras.agent.travel_agent
-    from app.infras.agent.travel_agent import graph_app
+async def main():
+    print("🚀 启动交互式测试终端 (按 'q' 或 'exit' 退出)")
+    print("--------------------------------------------------")
 
-    # 允许用户自定义 ID，方便测试记忆功能
-    thread_id = input("请输入模拟 User ID (回车默认 'user_001'): ") or "user_001"
-    config = {"configurable": {"thread_id": thread_id}}
-
-    print(f"\n========== 开始交互式对话 (ID: {thread_id}) ==========")
-    print("指令说明:")
-    print(" - 输入 'q' 或 'quit' 退出")
-    print(" - 当系统暂停等待支付时，输入 'pay' 模拟支付回调")
-    print("====================================================\n")
+    # 您可以在这里修改 user_id 来模拟不同用户
+    user_id = "interactive_tester_001"
 
     while True:
-        # 1. 检查是否处于中断状态 (Wait Payment)
-        snapshot = graph_app.get_state(config)
-        next_steps = snapshot.next if hasattr(snapshot, 'next') else []
+        try:
+            # 1. 获取用户输入
+            user_input = input(f"\n👉 请输入 (User: {user_id}): ").strip()
 
-        if next_steps and "wait_payment" in next_steps:
-            print("\n[系统]: ⏸️  流程已在支付节点挂起 (Interrupt)。")
-            print("   (模拟场景：用户正在收银台付款...)")
-            user_input = input("User (输入 'pay' 确认支付, 或 'q' 退出): ")
+            if not user_input:
+                continue
 
-            if user_input.lower() in ["q", "quit"]:
+            if user_input.lower() in ["q", "exit", "quit"]:
+                print("👋 退出测试。")
                 break
 
-            if user_input.lower() == "pay":
-                print("\n[系统]: 收到支付回调，恢复执行...")
-                # 恢复执行：传入 None 继续
-                async for event in graph_app.astream(None, config):
-                    _print_event_message(event)
-                continue
-            else:
-                print("[系统]: ⚠️  模拟器限制：请先输入 'pay' 完成流程。")
+            if user_input.lower() == "clear":
+                print("\n" * 100)
                 continue
 
-        # 2. 正常对话输入
-        user_input = input("\nUser: ")
-        if user_input.lower() in ["q", "quit"]:
+            # 2. 调用 Agent 处理 (使用从 agent_runner 导入的函数)
+            await run_chat_stream(travel_agent, user_input, user_id)
+
+        except KeyboardInterrupt:
+            print("\n👋 用户强制退出。")
             break
-
-        # 3. 发送给 Agent
-        # 这里移除了 pass，改为解析并打印 event
-        async for event in graph_app.astream({"messages": [HumanMessage(content=user_input)]}, config):
-            _print_event_message(event)
-
-        # 4. 打印当前状态快照 (Debug)
-        snapshot = graph_app.get_state(config)
-        step = snapshot.values.get('step')
-        dest = snapshot.values.get('destination')
-        print(f"   🛠️ [State]: Step={step}, Dest={dest}")
-
-
-def _print_event_message(event):
-    """辅助函数：从 LangGraph 事件中提取并打印 AI 回复"""
-    for node_name, values in event.items():
-        # values 是节点返回的字典，通常包含 'messages'
-        if "messages" in values and values["messages"]:
-            last_msg = values["messages"][-1]
-            if hasattr(last_msg, "content") and last_msg.content:
-                # 打印 AI 的回复内容
-                print(f"\nAgent: {last_msg.content}")
-
+        except Exception as e:
+            print(f"❌ 未知错误: {e}")
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(run_interactive())
-    except KeyboardInterrupt:
-        print("\n\n程序已退出。")
+    if sys.platform == "win32":
+        # Windows下解决 asyncio 事件循环问题
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    asyncio.run(main())

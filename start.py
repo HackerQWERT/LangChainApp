@@ -1,6 +1,5 @@
 import uvicorn
-# from app import main
-from app.infras.agent.travel_agent import graph_app as app
+from app.infras.agent.travel_agent import travel_agent
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage, BaseMessage, AIMessage
 from app import main
