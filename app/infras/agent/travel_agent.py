@@ -1,9 +1,11 @@
 import os
+import re
 import operator
 import json
 import asyncio
-from typing import Annotated, List, TypedDict, Literal, Optional, Dict
-from typing_extensions import TypedDict as ExtTypedDict
+from datetime import datetime
+from typing import Annotated, List, Literal, Optional, Dict, Any
+from typing_extensions import TypedDict
 from dotenv import load_dotenv
 
 from langchain_openai import AzureChatOpenAI
@@ -12,774 +14,727 @@ from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 
-# 导入你的工具
-from app.infras.func import (
-    lookup_airport_code,
-    search_flights,
-    confirm_flight,
-    confirm_hotel,
-    lock_flight,
-    lock_hotel,
-    query_booked_flights,
-    query_booked_hotels,
-    get_weather,
-    search_travel_guides,
-    search_hotels,
-    get_current_time
-)
+# --- 1. 导入真实工具 ---
+try:
+    from app.infras.func import (
+        get_current_time,
+        lookup_airport_code,
+        search_flights,
+        search_hotels,
+        search_travel_guides,
+        lock_flight,
+        lock_hotel,
+        confirm_flight,
+        confirm_hotel,
+        get_weather
+    )
+except ImportError:
+    raise ImportError("请确保 airport_tools.py 模块存在且包含所有必要的工具函数。")
 
-# --- 0. 配置与初始化 ---
+# --- 0. 配置 ---
 load_dotenv()
-
 llm = AzureChatOpenAI(
-    azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-5"),
-    api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2025-01-01-preview"),
+    azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4o"),
+    api_version=os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview"),
     azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
     api_key=os.getenv("AZURE_OPENAI_API_KEY"),
     temperature=0.5,
 )
 
-# 定义 JSON 模式的 LLM
-json_llm = llm.bind(response_format={"type": "json_object"})
+# --- 1. Schema 定义 ---
 
-# --- 1. 核心 State 定义 ---
+
+class RouterOutput(BaseModel):
+    """意图路由决策"""
+    decision: Literal["update_info", "side_chat", "check_weather", "continue", "confirm_plan"] = Field(
+        ..., description="confirm_plan: 当且仅当用户明确选择了某个旅行方案时"
+    )
+    chosen_index: Optional[int] = Field(
+        None, description="如果decision是confirm_plan，这里必须提取索引(0-2)，否则为None")
+    reason: str = Field(..., description="理由")
+
+
+class CollectOutput(BaseModel):
+    destination: Optional[str]
+    origin: Optional[str]
+    dates: Optional[str]
+    reply: str
+
+
+class PlanDetail(BaseModel):
+    id: int
+    name: str
+    price_estimate: str
+    details: str
+
+
+class PlanGenOutput(BaseModel):
+    plans: List[PlanDetail]
+    reply_text: str
+
+
+class SelectionAction(BaseModel):
+    action_item: Optional[Literal["flight", "hotel"]]
+    action_type: Literal["select", "skip", "invalid"]
+    selected_id: Optional[str]
+    # item_info removed to avoid OpenAI Structured Output schema validation error (Dict[str, Any] is not supported in strict mode)
+    reply: str
+
+
+class GuideOutput(BaseModel):
+    guidance: str
+
+
+class WeatherQuery(BaseModel):
+    location: str
+
+# --- 2. State 定义 ---
 
 
 class TravelState(TypedDict):
     messages: Annotated[List[BaseMessage], operator.add]
 
-    # 状态流转
-    step: Literal["collect", "plan", "review",
-                  "searching", "selecting", "wait_payment", "finish"]
+    step: Literal[
+        "collect",          # 收集信息
+        "plan",             # 规划生成
+        "choose_plan",      # 选择方案
+        "search_flight",    # 搜索机票
+        "select_flight",    # 选择机票
+        "pay_flight",       # 支付机票
+        "search_hotel",     # 搜索酒店
+        "select_hotel",     # 选择酒店
+        "pay_hotel",        # 支付酒店
+        "summary",          # 总结
+        "finish"            # 结束
+    ]
 
-    # 基础槽位 (已移除 budget)
     destination: Optional[str]
     origin: Optional[str]
     dates: Optional[str]
-    # budget: Optional[str]  <-- Removed
 
-    # 方案相关
     generated_plans: Optional[List[Dict]]
     chosen_plan_index: Optional[int]
 
-    # 实时搜索结果缓存
-    realtime_options: Optional[Dict]  # { "flights": [...], "hotels": [...] }
-
-    # 待支付的订单信息 (包含锁单后的 order_id)
+    realtime_options: Optional[Dict]
     pending_selection: Optional[Dict]
-
-    # 预订状态 (记录是否已完成预订)
-    booking_status: Optional[Dict]    # { "flight": bool, "hotel": bool }
-
+    booking_status: Optional[Dict]
     booking_results: Optional[Dict]
-    # 新增 "check_weather" 状态
-    router_decision: Literal["continue",
-                             "side_chat", "modify", "check_weather"]
 
-# --- 2. 意图识别 (Router) ---
+    router_decision: str
+
+# --- 3. 核心节点 ---
 
 
 async def intent_router_node(state: TravelState):
-    """
-    升级后的路由：优化 Review 阶段的意图识别，防止方案选择被误判为闲聊
-    """
     if not state.get("messages"):
         return {"router_decision": "continue"}
 
     last_msg = state["messages"][-1].content
     current_step = state.get("step", "collect")
 
-    # 获取当前上下文中的关键信息（用于辅助判断）
-    # 如果处于 Review 阶段，把方案名喂给 Router，让它知道这些词不是闲聊
     context_info = ""
-    if current_step == "review":
+    if current_step == "choose_plan":
         plans = state.get("generated_plans", [])
-        plan_names = [p['name'] for p in plans]
-        context_info = f"当前待选方案名: {plan_names}"
-    elif current_step == "wait_payment":
-        context_info = "当前处于支付确认阶段，用户需要确认支付。"
-    elif current_step == "finish":
-        context_info = "当前订单已完成/已结束。用户可能在询问结果、感谢或发起新话题。"
+        plan_names = [f"{i}: {p['name']}" for i, p in enumerate(plans)]
+        context_info = f"用户需从方案中选择: {plan_names}。"
+    elif current_step in ["pay_flight", "pay_hotel"]:
+        context_info = "CRITICAL: 支付确认阶段。等待用户输入'确认'或'支付'。"
+    elif current_step in ["select_flight", "select_hotel"]:
+        context_info = "用户正在选择具体的机票或酒店资源 (如 F1, H1)。这属于 continue 行为，不是 confirm_plan。"
 
-    router_prompt = f"""
-    你是一个意图分类器。用户当前处于 "{current_step}" 阶段。
-    用户最新输入是: "{last_msg}"
-    {context_info}
-
-    请判断用户意图并输出 JSON (modify / side_chat / check_weather / continue):
-
-    当前步骤 "{current_step}" 的有效操作定义：
-    - collect: 提供/补充 目的地、时间。 (注意：不再需要预算)
-    - plan: 等待生成。
-    - review: 用户正在进行方案选择。注意：如果用户提及方案中的关键词（如“特种兵”、“舒适”、“第一个”），或者针对方案提问，都属于 "continue"。
-    - selecting: 选择具体资源 (如"订F1", "预订酒店H2", "全都要", "只要机票")。
-    - wait_payment: 确认支付、支付、好的、确认等同意支付的词汇；或者询问总价详情。这都属于 "continue"。
-    - finish: 订单已结束。用户的任何追问（如“成功了吗”）通常归类为 continue 或 side_chat；如果用户想去新地方，归类为 modify。
-
-    规则：
-    1. "modify": 用户明确想改核心需求（如“不去日本了去泰国”），或者在finish阶段想开启新行程。
-    2. "check_weather": 用户明确询问天气、气温、下雨等气象信息。
-    3. "side_chat": 只有当用户的话题完全脱离当前业务流（如询问毫无关系的知识、闲聊无关话题）时才选此项。**如果在 Review 阶段提及了方案名中的词（如特种兵），绝对不是 side_chat，而是 continue。**
-    4. "continue": 用户正在进行当前步骤的有效操作（包括选择方案、确认支付、订单完成后的追问）。
-
-    输出格式: {{ "decision": "...", "reason": "..." }}
+    prompt = f"""
+    我是意图分类器。当前步骤: "{current_step}"。
+    用户输入: "{last_msg}"
+    上下文: {context_info}
+    
+    决策逻辑：
+    1. **confirm_plan**: (仅在 choose_plan 阶段有效) 用户明确选择了旅行方案(如方案1、方案2)。如果当前步骤不是 choose_plan，绝对不要输出 confirm_plan。
+    2. **update_info**: 用户想修改核心信息(地点/时间)。
+    3. **check_weather**: 用户询问天气。
+    4. **side_chat**: 闲聊 或 无效输入。
+    5. **continue**: 用户正在配合当前步骤(如回答问题、选择机票(F1/F2)、确认支付)。
+       - 注意: 如果当前是 select_flight/select_hotel 阶段，用户输入 F1, H1 等代表选择资源，属于 continue。
+    
+    必须输出 decision 和 chosen_index (仅confirm_plan需要)。
     """
 
+    structured_llm = llm.with_structured_output(RouterOutput)
     try:
-        response = await json_llm.ainvoke([HumanMessage(content=router_prompt)])
-        result = json.loads(response.content)
-    except Exception as e:
-        print(f"Router Error: {e}")
-        return {"router_decision": "continue"}
+        res: RouterOutput = await structured_llm.ainvoke([HumanMessage(content=prompt)])
+        decision = res.decision
+        chosen_idx = res.chosen_index
+    except Exception:
+        decision = "continue"
+        chosen_idx = None
 
-    print(f"🚦 [Router] Decision: {result['decision']} ({result['reason']})")
-    return {"router_decision": result["decision"]}
+    print(f"🚦 [Router] Step={current_step} Decision={decision}")
 
-# --- 3. 节点逻辑 ---
+    if decision == "confirm_plan" and chosen_idx is not None:
+        return {
+            "router_decision": decision,
+            "chosen_plan_index": chosen_idx,
+        }
 
-# 3.1 收集需求 (已移除 Budget)
+    return {"router_decision": decision}
 
 
 async def collect_requirements_node(state: TravelState):
-    print("📋 [Node] Collecting Requirements...")
-    current_slots = {
-        "destination": state.get("destination"),
-        "origin": state.get("origin"),
-        "dates": state.get("dates")
-        # "budget": state.get("budget") <-- Removed
-    }
-    last_content = state['messages'][-1].content if state.get(
-        'messages') else ""
+    print("📋 [Node] Collecting Info...")
 
+    # 1. 获取当前时间 (辅助日期计算)
+    try:
+        now_str = get_current_time.invoke({})
+    except Exception:
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    current_slots = {k: state.get(k)
+                     for k in ["destination", "origin", "dates"]}
+    last_content = state['messages'][-1].content
+
+    # 2. 增强 Prompt: 注入当前时间，并要求精确到天
     prompt = f"""
-    你是专业的旅行顾问。收集信息：目的地、出发地、日期。
-    (注意：我们不再询问预算信息)
+    当前系统时间: {now_str}
+    已收集信息: {json.dumps(current_slots)}
+    用户输入: "{last_content}"
     
-    当前已知: {json.dumps(current_slots, ensure_ascii=False)}
-    用户回复: "{last_content}"
-    
-    请输出 JSON:
-    1. 提取 updated_slots
-    2. is_complete (bool) - 当目的地、出发地、日期都具备时为 true
-    3. reply (text)
-       - 如果信息不全，请礼貌追问。
-       - **如果 is_complete 为 true (信息已全)，请回复：“信息已确认，正在为您调用攻略并生成定制方案，请稍候...” (不要问用户是否需要方案，因为下一步会自动生成)。**
-    
-    输出格式: {{ "updated_slots": {{...}}, "is_complete": bool, "reply": "..." }}
+    任务:
+    1. 更新 destination (目的地), origin (出发地), dates (日期)。
+    2. **日期处理核心规则**: 
+       - 必须利用当前系统时间，将用户的口语时间（如"下周五"、"后天"）转换为标准的 **YYYY-MM-DD** 格式。
+       - 只有当日期明确到 **具体某一天** 时，才算收集完成。如果用户只说了"下个月"或"计划去旅游"，dates 字段必须留空 (null)，并在 reply 中追问具体出发日期。
+    3. **地点处理核心规则**:
+       - 目的地和出发地必须明确到 **具体城市** (如 "东京", "大阪", "纽约")。
+       - 如果用户只提供了国家 (如 "日本", "美国") 或模糊地区，destination/origin 字段必须留空 (null)，并在 reply 中追问具体城市。
+    4. reply: 回复用户。如果缺少必要信息(具体城市/明确日期)，请礼貌追问；如果收集齐全，请确认信息。
     """
-    response = await json_llm.ainvoke([HumanMessage(content=prompt)])
-    data = json.loads(response.content)
 
-    updates = data["updated_slots"]
-    updates["messages"] = [AIMessage(content=data["reply"])]
+    structured_llm = llm.with_structured_output(CollectOutput)
+    res = await structured_llm.ainvoke([HumanMessage(content=prompt)])
 
-    if data["is_complete"]:
+    updates = {"messages": [AIMessage(content=res.reply)]}
+    if res.destination:
+        updates["destination"] = res.destination
+    if res.origin:
+        updates["origin"] = res.origin
+    if res.dates:
+        updates["dates"] = res.dates
+
+    if (res.destination or current_slots["destination"]) and \
+       (res.origin or current_slots["origin"]) and \
+       (res.dates or current_slots["dates"]):
         updates["step"] = "plan"
-
+    else:
+        updates["step"] = "collect"
     return updates
-
-# 3.2 生成方案 (集成 search_travel_guides)
 
 
 async def generate_plans_node(state: TravelState):
-    print("💡 [Node] Generating Plans (with Real RAG)...")
+    print("💡 [Node] Planning (Calling Real Guide Search)...")
+    dest = state.get('destination')
 
-    dest = state.get("destination", "未知")
-    # 移除预算字段
-    reqs = f"从 {state.get('origin')} 去 {dest}, 时间 {state.get('dates')}"
-
-    # 1. 先调用攻略工具，获取真实上下文
-    print(f"   -> Calling search_travel_guides('{dest} 旅行攻略')...")
+    # 1. 真实调用：获取旅游攻略
     try:
-        guides_context = await search_travel_guides.ainvoke({"query": f"{dest} 旅游攻略 必去景点 行程建议"})
+        guides_res = await search_travel_guides.ainvoke({"query": f"{dest} 旅游攻略 必玩景点"})
     except Exception as e:
-        guides_context = "暂无详细攻略，请根据常识生成。"
-        print(f"   -> Guide search failed: {e}")
+        guides_res = f"攻略搜索暂时不可用: {e}"
 
-    # 2. 基于真实攻略生成方案
+    # 2. 基于攻略生成方案
     prompt = f"""
-    基于用户需求: {reqs}
-    以及目的地的真实攻略信息:
-    {str(guides_context)[:2000]} (截取部分)
-    
-    请生成 3 个截然不同的旅行方案 (例如：经济型、舒适型、豪华型，或者特种兵、深度游等)。
-    方案内容必须结合上述攻略中的真实景点和特色。
-    
-    输出 JSON: {{ "plans": [{{ "id": 1, "name": "...", "price_estimate": "...", "details": "..." }}...], "reply_text": "..." }}
+    目的地: {dest}。
+    参考攻略: {str(guides_res)[:800]}。
+    任务: 生成3个差异化的旅行方案（如经济、豪华、亲子）。
     """
-    response = await json_llm.ainvoke([HumanMessage(content=prompt)])
-    data = json.loads(response.content)
+    structured_llm = llm.with_structured_output(PlanGenOutput)
+    res = await structured_llm.ainvoke([HumanMessage(content=prompt)])
 
-    pretty_msg = data["reply_text"] + "\n"
-    for p in data["plans"]:
-        # price_estimate 是 LLM 估算的文本，不再是具体的 budget 数字
-        pretty_msg += f"\n方案 {p['id']}: {p['name']} ({p.get('price_estimate', '价格待定')}) - {p['details']}"
+    plans_data = [p.dict() for p in res.plans]
+    pretty_msg = res.reply_text + "\n" + \
+        "\n".join(
+            [f"方案 {i}: {p.name} ({p.price_estimate})" for i, p in enumerate(res.plans)])
 
     return {
-        "generated_plans": data["plans"],
-        "step": "review",
-        "messages": [AIMessage(content=pretty_msg)]
+        "generated_plans": plans_data,
+        "step": "choose_plan",
+        "messages": [AIMessage(content=pretty_msg)],
+        "booking_status": {"flight": False, "hotel": False}
     }
 
-# 3.3 审核方案 -> 跳转搜索 (已修复：使用语义匹配)
 
+async def search_flight_node(state: TravelState):
+    print("🔍 [Node] Searching Flights...")
 
-async def review_plan_node(state: TravelState):
-    print("🤔 [Node] Reviewing Plan (Semantic Matching)...")
-    last_msg = state["messages"][-1].content
-    plans = state.get("generated_plans", [])
+    origin_raw = state.get("origin", "Beijing")
+    dest_raw = state.get("destination", "Shanghai")
+    travel_date = state.get("dates", datetime.now().strftime("%Y-%m-%d"))
 
-    if not plans:
-        return {"messages": [AIMessage(content="方案数据丢失，请重新规划。")], "step": "plan"}
+    # === 城市名 -> 机场代码转换 ===
+    async def get_iata_code(city_name: str) -> str:
+        if re.match(r"^[A-Z]{3}$", city_name):
+            return city_name
 
-    # 构建 Prompt 让 LLM 帮我们识别用户选了哪个方案
-    # 将方案简化成 ID: Name 的形式给 LLM 参考
-    plan_options = "\n".join(
-        [f"ID {i}: {p['name']} ({p.get('details', '')[:20]}...)" for i, p in enumerate(plans)])
+        search_query = city_name
+        if any('\u4e00' <= char <= '\u9fff' for char in city_name):
+            print(
+                f"   -> Detected Chinese in '{city_name}', translating to English...")
+            try:
+                trans_msg = await llm.ainvoke([HumanMessage(content=f"Please translate '{city_name}' to English city name. Return ONLY the name, no punctuation.")])
+                search_query = trans_msg.content.strip()
+                print(f"   -> Translated: {city_name} -> {search_query}")
+            except Exception as e:
+                print(f"   -> Translation failed: {e}")
 
-    prompt = f"""
-    用户正在从以下旅行方案中进行选择：
-    {plan_options}
+        print(f"   -> Converting city '{search_query}' to IATA code...")
+        try:
+            res_str = await lookup_airport_code.ainvoke(search_query)
+            match = re.search(r"\(([A-Z]{3})\)", str(res_str))
+            if match:
+                code = match.group(1)
+                print(f"   -> Mapped '{city_name}' to '{code}'")
+                return code
+            else:
+                print(
+                    f"   -> Code conversion failed for '{search_query}', using original.")
+                return city_name
+        except Exception as e:
+            print(f"   -> Error looking up code: {e}")
+            return city_name
 
-    用户输入: "{last_msg}"
+    origin_code, dest_code = await asyncio.gather(
+        get_iata_code(origin_raw),
+        get_iata_code(dest_raw)
+    )
 
-    任务：
-    判断用户选择了哪一个方案。
-    1. 如果用户明确选择了某个方案（通过ID、名称关键词、或者描述如“最便宜的”、“特种兵”），返回 index (0, 1, 2)。
-    2. 如果用户没有做出选择（例如只是在提问，或者由于犹豫不决），返回 -1。
+    print(
+        f"   -> Calling Flight Search API: {origin_code} -> {dest_code} on {travel_date}")
 
-    输出 JSON: {{ "chosen_index": int, "reply": "若未选择时的引导语" }}
-    """
+    flight_res = await search_flights.ainvoke({
+        "origin": origin_code,
+        "destination": dest_code,
+        "date": travel_date
+    })
 
     try:
-        response = await json_llm.ainvoke([HumanMessage(content=prompt)])
-        result = json.loads(response.content)
-        idx = result.get("chosen_index", -1)
-    except Exception as e:
-        print(f"Review Match Error: {e}")
-        idx = -1
+        raw_flights = json.loads(flight_res) if isinstance(
+            flight_res, str) else flight_res
+    except:
+        raw_flights = [{"error": str(flight_res)}]
 
-    # 初始化 booking_status
-    initial_booking_status = {"flight": False, "hotel": False}
+    msg = f"已为您查询到 {origin_code} -> {dest_code} 的机票：\n"
+    if isinstance(raw_flights, list) and len(raw_flights) > 0 and "error" not in raw_flights[0]:
+        for i, f in enumerate(raw_flights[:5]):
+            airline = f.get('airline', '未知航司')
+            fnum = f.get('flight_number', '未知航班号')
+            dept = f.get('departure', '未知出发时间')
+            arr = f.get('arrival', '未知到达时间')
+            dur = f.get('duration', '未知时长')
+            price = f.get('price', '未知价格')
+            link = f.get('link')
 
-    # 逻辑分支
-    if idx != -1 and 0 <= idx < len(plans):
-        selected = plans[idx]
-        return {
-            "chosen_plan_index": idx,
-            "step": "searching",  # 成功匹配，进入下一步
-            "booking_status": initial_booking_status,
-            "booking_results": {},
-            "messages": [AIMessage(content=f"好的，选择了【方案{idx+1}: {selected['name']}】。正在为您调用接口搜索实时资源...")]
-        }
+            msg += f"**[F{i+1}] {airline}**\n"
+            msg += f"   - 航班: {fnum}\n"
+            msg += f"   - 价格: {price}\n"
+            msg += f"   - 出发: {dept}\n"
+            msg += f"   - 到达: {arr}\n"
+            msg += f"   - 时长: {dur}\n"
+            if link:
+                msg += f"   - 链接: {link}\n"
+            msg += "\n"
     else:
-        # 匹配失败，或者用户在犹豫，停留在当前步骤
-        fallback_msg = result.get("reply", "请问您具体想选择哪一个方案呢？（可以说“方案1”或“特种兵那个”）")
-        return {
-            "messages": [AIMessage(content=fallback_msg)]
-            # step 保持不变，还是 review，等待用户下一次输入
-        }
+        err_msg = raw_flights[0].get('error') if isinstance(
+            raw_flights, list) else "No data"
+        msg += f"未查询到有效航班 ({err_msg})。\n"
 
-# 3.4 实时搜索 (集成 search_flights / search_hotels)
-
-
-async def search_realtime_node(state: TravelState):
-    print("🔍 [Node] Searching Realtime Options (API)...")
-
-    dest = state.get("destination", "Unknown")
-    origin = state.get("origin", "Unknown")
-    date_str = state.get("dates", "Unknown")
-
-    print(f"   -> API: Flights({origin}->{dest}) | Hotels({dest})...")
-
-    # 并行调用
-    flight_task = search_flights.ainvoke(
-        {"origin": origin, "destination": dest, "date": date_str})
-    hotel_task = search_hotels.ainvoke(
-        {"location": dest, "check_in": date_str, "check_out": "flexible"})
-
-    raw_flights, raw_hotels = await asyncio.gather(flight_task, hotel_task)
-
-    # 清洗数据
-    structure_prompt = f"""
-    你是一个数据清洗专家。请将以下从搜索引擎获取的原始文本结果，转换为标准的 JSON 选项列表。
-    
-    原始机票结果:
-    {raw_flights}
-    
-    原始酒店结果:
-    {raw_hotels}
-    
-    任务:
-    1. 提取 2-3 个最佳机票选项 (ID为 F1, F2...)。
-    2. 提取 2-3 个最佳酒店选项 (ID为 H1, H2...)。
-    3. 如果搜索结果为空或乱码，请基于常识生成 2 个合理的模拟选项作为兜底，并在 carrier/name 中标注 "(模拟数据)"。
-    
-    输出 JSON 格式:
-    {{
-        "flights": [{{ "id": "F1", "carrier": "...", "time": "...", "price": "..." }}],
-        "hotels": [{{ "id": "H1", "name": "...", "rating": "...", "price": "..." }}],
-        "message": "为您找到以下资源..." (简短引导语)
-    }}
-    """
-
-    response = await json_llm.ainvoke([HumanMessage(content=structure_prompt)])
-    data = json.loads(response.content)
-
-    msg = f"{data['message']}\n\n"
-    msg += "**✈️ 机票选项**:\n"
-    for f in data["flights"]:
-        msg += f"- [ID: {f['id']}] {f['carrier']} ({f['time']}) 价格: {f['price']}\n"
-
-    msg += "\n**🏨 酒店选项**:\n"
-    for h in data["hotels"]:
-        msg += f"- [ID: {h['id']}] {h['name']} (评分: {h['rating']}) 价格: {h['price']}\n"
-
-    msg += "\n请告诉我您的选择（例如：“订机票F1” 或 “订F1和H1”）。"
+    msg += "\n请告诉我您要锁定哪个 **机票** (输入 F1, F2...)。"
 
     return {
-        "realtime_options": {"flights": data["flights"], "hotels": data["hotels"]},
-        "step": "selecting",
+        "realtime_options": {"flights": raw_flights},
+        "step": "select_flight",
         "messages": [AIMessage(content=msg)]
     }
 
-# 3.5 执行选品与计算总价 + 锁单 (Locking) - 支持分步处理与严格校验
 
-
-async def execute_selection_node(state: TravelState):
-    print("⚙️ [Node] Processing Selection, Locking (One-by-One/Independent)...")
-
+async def select_flight_node(state: TravelState):
+    print("⚙️ [Node] Locking Flight...")
     last_msg = state["messages"][-1].content
     options = state.get("realtime_options", {})
-    current_status = state.get(
-        "booking_status", {"flight": False, "hotel": False})
 
-    # 提取有效 ID 列表，用于 Prompt 强校验
-    valid_flight_ids = [f['id'] for f in options.get('flights', [])]
-    valid_hotel_ids = [h['id'] for h in options.get('hotels', [])]
+    valid_f = []
+    if isinstance(options.get('flights'), list):
+        valid_f = [f"[F{i+1}] {f.get('flight_number') or f.get('id')}"
+                   for i, f in enumerate(options['flights']) if isinstance(f, dict)]
 
     prompt = f"""
-    用户正在选择预订资源。
     用户输入: "{last_msg}"
-    当前预订状态: {json.dumps(current_status)}
+    可选机票列表: {valid_f}
     
-    **有效资源 ID 列表 (必须严格匹配)**:
-    - 有效机票 ID: {valid_flight_ids}
-    - 有效酒店 ID: {valid_hotel_ids}
-    
-    任务：
-    1. 提取用户意图中的机票 ID 和 酒店 ID。
-    2. **校验有效性**：用户输入的 ID 必须在上述有效列表中。如果不在，标记为 invalid。**严禁自动修正或猜测 ID**。
-    3. **处理逻辑 (独立操作)**：
-       - 识别用户想要操作的项目（Select 或 Skip）。
-       - **无需强制顺序**：用户可以先选酒店，也可以先选机票。
-       - **冲突处理**：如果用户同时选择了机票和酒店（例如 "F1 H1"），请优先处理 **机票**，并在 reply 中说明“先为您锁定机票，稍后处理酒店”。
-       - **状态检查**：如果用户尝试选择已完成（True）的项目，提示已完成。
-    
-    输出 JSON: 
-    {{ 
-        "action_item": "flight" or "hotel" or null,
-        "action_type": "select" or "skip" or "invalid" or "error", 
-        "selected_id": "...", // 仅当 valid 时返回 ID
-        "item_info": {{ "id": "...", "price_text": "..." }} or null,
-        "reply": "..." // 针对有效选择，请回复“正在为您锁定 [项目]...”
-    }}
+    任务: 识别用户想选哪个机票。
+    1. 如果用户输入 "F1", "F2" 等编号，请根据列表提取对应的真实 ID (如 "UA 889") 作为 selected_id。
+    2. 输出 action_type: select/skip/invalid。
     """
 
-    response = await json_llm.ainvoke([HumanMessage(content=prompt)])
-    decision = json.loads(response.content)
+    structured_llm = llm.with_structured_output(SelectionAction)
+    decision = await structured_llm.ainvoke([HumanMessage(content=prompt)])
 
-    action_item = decision.get("action_item")
-    action_type = decision.get("action_type")
-    selected_id = decision.get("selected_id")
-    reply = decision.get("reply", "请明确您的选择。")
-
-    # 1. 处理错误或无效 ID
-    if action_type in ["invalid", "error"] or not action_item:
-        return {
-            "messages": [AIMessage(content=reply)]
-        }
-
-    # 2. 处理“跳过”逻辑
-    if action_type == "skip":
-        new_status = current_status.copy()
-        new_status[action_item] = True  # 标记为已完成
-
-        # 检查是否还有剩下的
-        msg = f"好的，为您跳过{action_item}。"
-        if not new_status["flight"]:
-            msg += " 接下来，请选择机票。"
-        elif not new_status["hotel"]:
-            msg += " 接下来，请选择酒店。"
-        else:
-            msg += " 所有项目已处理完毕，正在生成总结..."
-
-        return {
-            "booking_status": new_status,
-            "step": "selecting",
-            "messages": [AIMessage(content=msg)]
-        }
-
-    # 3. 处理“锁定 (select)”逻辑
-    if action_type == "select" and selected_id:
-        lock_logs = []
-        order_id = None
-
-        print(f"   -> Locking {action_item} {selected_id}...")
-
+    if decision.action_type == "select":
+        target_id = decision.selected_id
+        order_id = "ERR"
         try:
-            if action_item == "flight":
-                lock_res = await lock_flight.ainvoke({
-                    "flight_number": selected_id,
-                    "date": state.get("dates", "unknown")
-                })
-            else:
-                lock_res = await lock_hotel.ainvoke({
-                    "hotel_name": selected_id,
-                    "check_in": state.get("dates", "unknown")
-                })
-            order_id = str(lock_res).strip()
-            lock_logs.append(
-                f"{action_item} {selected_id} 锁定成功 (订单号: {order_id})")
+            res = await lock_flight.ainvoke({
+                "flight_number": target_id,
+                "date": state.get("dates"),
+                "from_airport": state.get("origin"),
+                "to_airport": state.get("destination"),
+                "passenger": "Default User",
+                "user_id": "current_user"
+            })
+            order_id = res
         except Exception as e:
-            print(f"❌ Locking failed: {e}")
-            return {
-                "messages": [AIMessage(content=f"{selected_id} 锁定失败: {e}。请重试。")]
-            }
+            return {"messages": [AIMessage(content=f"🔒 锁定失败: {str(e)} 请重试。")]}
 
-        # 构建待支付信息 (安全获取 price_text)
-        item_info = decision.get("item_info") or {}
-        price = item_info.get("price_text", "价格待定")
-
-        pending_info = {
-            "type": action_item,      # 记录当前待支付的是 flight 还是 hotel
-            "info": decision.get("item_info"),
-            "order_id": order_id,
-            "price": price
+        pending = {
+            "type": "flight",
+            "info": {"id": target_id},
+            "order_id": order_id
         }
-
-        # 更新回复文案，强调锁定和尽快支付
-        reply_msg = f"{reply}\n\n" + "\n".join(lock_logs) + \
-            f"\n\n**资源已锁定，请尽快支付！**\n💰 待支付金额：{price}\n(请回复“确认支付”)"
-
-        # 进入支付确认状态
         return {
-            "pending_selection": pending_info,
-            "step": "wait_payment",
-            "messages": [AIMessage(content=reply_msg)]
+            "pending_selection": pending,
+            "step": "pay_flight",
+            "messages": [AIMessage(content=f"已锁定机票 (单号: {order_id})，请回复'确认'以支付。")]
         }
 
-    return {"messages": [AIMessage(content="操作无法识别，请重试。")]}
+    elif decision.action_type == "skip":
+        return {"step": "search_hotel", "messages": [AIMessage(content="已跳过机票预订，即将查询酒店。")]}
+
+    return {"messages": [AIMessage(content="无法识别您的选择，请明确输入机票编号 (如 F1)。")]}
 
 
-# 3.5.1 处理支付并确认订单 (Confirming) - 支持循环检测
+async def pay_flight_node(state: TravelState):
+    print("💳 [Node] Paying Flight...")
+    pending = state.get("pending_selection")
+    if not pending or pending["type"] != "flight":
+        return {"step": "search_hotel", "messages": [AIMessage("无待支付机票订单，进入酒店查询。")]}
 
-async def process_payment_node(state: TravelState):
-    print("💳 [Node] Processing Payment & Confirming Orders...")
+    order_id = pending["order_id"]
+    try:
+        await confirm_flight.ainvoke({"order_id": order_id})
+    except Exception as e:
+        return {"messages": [AIMessage(f"支付确认失败: {e}")]}
 
-    pending = state.get("pending_selection", {})
-    item_type = pending.get("type")  # flight / hotel
-    order_id = pending.get("order_id")
+    new_results = state.get("booking_results", {}).copy()
+    # 保存 航班号 + 订单号
+    flight_info = pending["info"].copy()
+    flight_info["order_id"] = order_id
+    new_results["flight"] = flight_info
 
-    current_status = state.get(
-        "booking_status", {"flight": False, "hotel": False}).copy()
+    return {
+        "booking_results": new_results,
+        "pending_selection": None,
+        "step": "search_hotel",
+        "messages": [AIMessage(f"✅ 机票支付成功！接下来为您查询酒店。")]
+    }
 
-    # 保存已预订的结果，用于最终总结
-    booking_results = state.get("booking_results", {}).copy()
 
-    # 1. 确认订单
-    confirm_logs = []
-    if order_id and item_type:
-        print(f"   -> Confirming {item_type} Order {order_id}...")
-        try:
-            if item_type == "flight":
-                await confirm_flight.ainvoke({"order_id": order_id})
-            else:
-                await confirm_hotel.ainvoke({"order_id": order_id})
+async def search_hotel_node(state: TravelState):
+    print("🔍 [Node] Searching Hotels...")
+    dest_raw = state.get("destination", "Shanghai")
+    travel_date = state.get("dates", datetime.now().strftime("%Y-%m-%d"))
 
-            confirm_logs.append(f"✅ {item_type} 订单 {order_id} 支付成功并已出票！")
-            current_status[item_type] = True  # 标记该项已完成
-            booking_results[item_type] = pending.get("info")  # 保存详情
+    print(f"   -> Calling Hotel Search API: {dest_raw} on {travel_date}")
+    hotel_res = await search_hotels.ainvoke({
+        "location": dest_raw,
+        "check_in": travel_date,
+        "check_out": "unknown"
+    })
 
-        except Exception as e:
-            confirm_logs.append(f"❌ {item_type} 订单确认失败: {e}")
-            # 失败了不更新状态，用户需要重试或重新选择
+    try:
+        raw_hotels = json.loads(hotel_res) if isinstance(
+            hotel_res, str) else hotel_res
+    except:
+        raw_hotels = [{"error": str(hotel_res)}]
 
-    # 2. 检查是否全部完成
-    is_flight_done = current_status.get("flight")
-    is_hotel_done = current_status.get("hotel")
-
-    if is_flight_done and is_hotel_done:
-        # 全部完成 -> Finish
-        plans = state.get("generated_plans", [])
-        chosen_idx = state.get("chosen_plan_index", 0)
-        chosen_plan = plans[chosen_idx] if plans and chosen_idx < len(
-            plans) else {"name": "自选行程", "details": ""}
-
-        flight_info = booking_results.get("flight", {})
-        hotel_info = booking_results.get("hotel", {})
-
-        summary = f"""
-        {' '.join(confirm_logs)}
-        
-        🎉 **所有预订已完成** 🎉
-        
-        📍 **行程方案**: {chosen_plan['name']}
-        ✈️ **机票**: {flight_info.get('carrier')} {flight_info.get('time')} ({flight_info.get('price')})
-        🏨 **酒店**: {hotel_info.get('name')} ({hotel_info.get('price')})
-        
-        祝您旅途愉快！
-        """
-        return {
-            "booking_status": current_status,
-            "booking_results": booking_results,
-            "pending_selection": None,  # 清空待支付
-            "step": "finish",
-            "messages": [AIMessage(content=summary)]
-        }
-
+    msg = f"已为您查询到 {dest_raw} 的酒店：\n"
+    if isinstance(raw_hotels, list) and len(raw_hotels) > 0 and "error" not in raw_hotels[0]:
+        for i, h in enumerate(raw_hotels[:5]):
+            hname = h.get('name') or h.get('id', 'N/A')
+            msg += f"- **[H{i+1}] {hname}**: {h.get('price', 'N/A')}\n"
     else:
-        # 还有未完成项 -> 回到 Selecting
-        missing = []
-        if not is_flight_done:
-            missing.append("机票")
-        elif not is_hotel_done:
-            missing.append("酒店")  # else if 保证顺序
+        msg += "未查询到结构化酒店信息。\n"
 
-        msg = f"{' '.join(confirm_logs)}\n\n接下来，请继续选择{'、'.join(missing)}。"
+    msg += "\n请告诉我您要锁定哪个 **酒店** (输入 H1, H2...)。"
 
+    return {
+        "realtime_options": {"hotels": raw_hotels},
+        "step": "select_hotel",
+        "messages": [AIMessage(content=msg)]
+    }
+
+
+async def select_hotel_node(state: TravelState):
+    print("⚙️ [Node] Locking Hotel...")
+    last_msg = state["messages"][-1].content
+    options = state.get("realtime_options", {})
+
+    valid_h = []
+    if isinstance(options.get('hotels'), list):
+        valid_h = [f"[H{i+1}] {h.get('name') or h.get('id')}"
+                   for i, h in enumerate(options['hotels']) if isinstance(h, dict)]
+
+    prompt = f"""
+    用户输入: "{last_msg}"
+    可选酒店列表: {valid_h}
+    
+    任务: 识别用户想选哪个酒店。
+    1. 如果用户输入 "H1", "H2" 等编号，请根据列表提取对应的真实 ID (如 "Hilton") 作为 selected_id。
+    2. 输出 action_type: select/skip/invalid。
+    """
+
+    structured_llm = llm.with_structured_output(SelectionAction)
+    decision = await structured_llm.ainvoke([HumanMessage(content=prompt)])
+
+    if decision.action_type == "select":
+        target_id = decision.selected_id
+        order_id = "ERR"
+        try:
+            res = await lock_hotel.ainvoke({
+                "hotel_name": target_id,
+                "check_in": state.get("dates"),
+                "location": state.get("destination"),
+                "user_id": "current_user"
+            })
+            order_id = res
+        except Exception as e:
+            return {"messages": [AIMessage(content=f"🔒 锁定失败: {str(e)} 请重试。")]}
+
+        pending = {
+            "type": "hotel",
+            "info": {"id": target_id},
+            "order_id": order_id
+        }
         return {
-            "booking_status": current_status,
-            "booking_results": booking_results,
-            "pending_selection": None,
-            "step": "selecting",
-            "messages": [AIMessage(content=msg)]
+            "pending_selection": pending,
+            "step": "pay_hotel",
+            "messages": [AIMessage(content=f"已锁定酒店 (单号: {order_id})，请回复'确认'以支付。")]
         }
 
+    elif decision.action_type == "skip":
+        return {"step": "summary", "messages": [AIMessage(content="已跳过酒店预订。")]}
 
-# =============================================================================
-# 3.6 新增: 专门的天气查询节点 (独立)
-# =============================================================================
+    return {"messages": [AIMessage(content="无法识别您的选择，请明确输入酒店编号 (如 H1)。")]}
+
+
+async def pay_hotel_node(state: TravelState):
+    print("💳 [Node] Paying Hotel...")
+    pending = state.get("pending_selection")
+    if not pending or pending["type"] != "hotel":
+        return {"step": "summary", "messages": [AIMessage("无待支付酒店订单，生成行程单。")]}
+
+    order_id = pending["order_id"]
+    try:
+        await confirm_hotel.ainvoke({"order_id": order_id})
+    except Exception as e:
+        return {"messages": [AIMessage(f"支付确认失败: {e}")]}
+
+    new_results = state.get("booking_results", {}).copy()
+    # 保存 酒店名 + 订单号
+    hotel_info = pending["info"].copy()
+    hotel_info["order_id"] = order_id
+    new_results["hotel"] = hotel_info
+
+    return {
+        "booking_results": new_results,
+        "pending_selection": None,
+        "step": "summary",
+        "messages": [AIMessage(f"✅ 酒店支付成功！")]
+    }
+
+
+async def generate_summary_node(state: TravelState):
+    print("📝 [Node] Generating Summary...")
+
+    # 1. 提取信息
+    res = state.get("booking_results", {})
+
+    f_info = res.get('flight', {})
+    flight_desc = f"{f_info.get('id', '未预订')} (订单号: {f_info.get('order_id', 'N/A')})"
+
+    h_info = res.get('hotel', {})
+    hotel_desc = f"{h_info.get('id', '未预订')} (订单号: {h_info.get('order_id', 'N/A')})"
+
+    plans = state.get("generated_plans", [])
+    idx = state.get("chosen_plan_index")
+    plan_details = "用户未选择特定方案"
+    if plans and idx is not None and 0 <= idx < len(plans):
+        p = plans[idx]
+        plan_details = f"方案: {p.get('name')}\n预算: {p.get('price_estimate')}\n详情: {p.get('details')}"
+
+    # 2. 生成总结
+    prompt = f"""
+    你是一名专业的旅行管家。请根据以下信息为用户生成一份最终的【旅行行程单】。
+    
+    📍 行程概览:
+    - 目的地: {state.get('destination', '未知')}
+    - 出发日期: {state.get('dates', '待定')}
+    
+    📦 已锁定资源:
+    - ✈️ 航班: {flight_desc}
+    - 🏨 酒店: {hotel_desc}
+    
+    🗺️ 规划参考:
+    {plan_details}
+    
+    要求:
+    1. 语气热情、专业。
+    2. 清晰列出已预订的航班和酒店，**务必包含订单号**以便用户核对。
+    3. 结合用户的规划参考，给出一两句游玩建议。
+    4. 使用 Markdown 格式排版。
+    """
+
+    ai_msg = await llm.ainvoke([HumanMessage(content=prompt)])
+
+    return {"step": "finish", "messages": [ai_msg]}
 
 
 async def check_weather_node(state: TravelState):
-    """
-    专门负责查询天气的节点。
-    智能分析用户意图中的地点，结合上下文进行查询。
-    """
-    print("🌤️ [Node] Checking Weather...")
+    """【天气节点】 真实调用 get_weather"""
+    print("☀️ [Node] Checking Weather (Real Tool)...")
     last_msg = state["messages"][-1].content
-    context_dest = state.get("destination")
 
-    # 智能提取地点 Prompt
-    extract_loc_prompt = f"""
-    用户正在请求天气查询。
-    用户输入: "{last_msg}"
-    当前上下文目的地: "{context_dest or '无'}"
-    
-    任务:
-    1. 优先从用户输入中提取地点 (如 "查询东京的天气" -> "东京")。
-    2. 若用户未提具体地点 (如 "那边天气怎么样"), 使用上下文目的地。
-    3. 若都无，返回 null。
-    
-    输出 JSON: {{ "location": "..." or null }}
-    """
+    structured = llm.with_structured_output(WeatherQuery)
+    q = await structured.ainvoke([HumanMessage(f"从这句话提取城市: {last_msg}")])
+    loc = q.location or state.get("destination") or "Beijing"
 
+    # 真实调用
     try:
-        res = await json_llm.ainvoke([HumanMessage(content=extract_loc_prompt)])
-        target_location = json.loads(res.content).get("location")
+        report = await get_weather.ainvoke({"location": loc})
     except Exception as e:
-        print(f"Weather Location Extract Error: {e}")
-        target_location = context_dest
+        report = f"无法获取天气: {e}"
 
-    if not target_location or target_location == "无":
-        return {"messages": [AIMessage(content="请问您想查询哪个城市的天气？")]}
-
-    print(f"   -> Calling tool get_weather for: {target_location}")
-    try:
-        # 调用天气工具
-        weather_result = await get_weather.ainvoke({"location": target_location})
-        return {"messages": [AIMessage(content=f"【{target_location}】天气实况:\n{weather_result}")]}
-    except Exception as e:
-        return {"messages": [AIMessage(content=f"查询 {target_location} 天气时暂时无法获取数据: {str(e)}")]}
-
-
-# 3.7 侧轨 (修改版：针对当前 State 进行 Context-Aware 的引导)
+    return {"messages": [AIMessage(content=f"【{loc}】天气报告: {report}")]}
 
 
 async def side_chat_node(state: TravelState):
-    """
-    Side Chat: 处理攻略查询、闲聊。
-    现在支持根据 state["step"] 进行上下文引导。
-    """
-    print("💬 [Node] Side Chat (Guides/Chat)...")
-    last_msg = state["messages"][-1].content
-    context_dest = state.get("destination")
-
-    # 1. 攻略/指南/玩法
-    if any(k in last_msg for k in ["攻略", "指南", "玩", "吃", "景点", "推荐"]):
-        print(f"   -> Guide Request: {last_msg}")
-        try:
-            query = f"{context_dest or ''} {last_msg}"
-            guides = await search_travel_guides.ainvoke({"query": query})
-            return {"messages": [AIMessage(content=f"为您找到相关攻略信息：\n{guides}")]}
-        except Exception as e:
-            return {"messages": [AIMessage(content="抱歉，攻略查询暂时不可用。")]}
-
-    # 2. 其他闲聊 (增强：结合当前步骤进行引导)
-    current_step = state.get("step", "collect")
-
-    guidance_map = {
-        "collect": "请礼貌地引导用户继续提供旅行的目的地、出发地或日期，以便开始规划。",
-        "plan": "告诉用户正在努力生成方案，请稍等。",
-        "review": "请引导用户对刚才生成的方案进行选择（如：您更倾向于哪个方案？），或者提出修改意见。",
-        "searching": "系统正在搜索资源，请让用户稍安勿躁。",
-        "selecting": "请引导用户完成机票和酒店的具体选择（如：您决定预订哪趟航班？），或者回复“跳过”。",
-        "wait_payment": "请提醒用户当前的订单待支付，需要回复“确认支付”来完成预订。",
-        "finish": "行程已规划完毕。可以陪用户闲聊，或者问用户是否想要规划一次新的旅行（如果是，引导其说出新目的地）。"
-    }
-
-    advice = guidance_map.get(current_step, "请引导用户回到旅行规划的主题。")
-
-    res = await llm.ainvoke([
-        SystemMessage(
-            content=f"你是一个风趣幽默的旅行助手。用户发来了闲聊内容：'{last_msg}'。\n请先礼貌或幽默地回应闲聊，然后**必须**根据当前流程状态进行引导。\n\n当前引导目标：{advice}"),
-        HumanMessage(content=last_msg)
-    ])
-
-    return {"messages": [res]}
+    if state.get("step") == "choose_plan":
+        return {"messages": [AIMessage("请明确选择一个方案（如：方案1），或者告诉我需要修改什么需求。")]}
+    return {"messages": [AIMessage(f"收到: {state['messages'][-1].content}")]}
 
 
-# 3.8 智能修改
+async def guide_node(state: TravelState):
+    step = state.get("step")
+    prompt = f"步骤: {step}。给用户一句简短引导。"
+    res = await llm.with_structured_output(GuideOutput).ainvoke([HumanMessage(prompt)])
+    return {"messages": [AIMessage(f"💁 {res.guidance}")]}
 
 
-async def modify_req_node(state: TravelState):
-    print("✏️ [Node] Modifying...")
-    return {
-        "step": "collect",
-        "generated_plans": [],
-        "messages": [AIMessage(content="好的，重新规划。请告诉我新的需求。")]
-    }
-
-
-def route_after_modify(state: TravelState):
-    if state.get("step") == "plan":
-        return "plan"
-    return END
-
-# --- 4. 构建图 ---
-
+# --- 4. 构建图与路由逻辑 ---
 
 workflow = StateGraph(TravelState)
 
-# 注册节点
 workflow.add_node("intent_router", intent_router_node)
 workflow.add_node("collect", collect_requirements_node)
 workflow.add_node("plan", generate_plans_node)
-workflow.add_node("review", review_plan_node)
-workflow.add_node("search_realtime", search_realtime_node)
-workflow.add_node("execute_select", execute_selection_node)  # 负责计算 + 锁单
-workflow.add_node("process_payment", process_payment_node)  # 负责支付 + 确认
-workflow.add_node("side_chat", side_chat_node)
-workflow.add_node("check_weather", check_weather_node)  # 新增节点
-workflow.add_node("modify", modify_req_node)
 
+# New Nodes
+workflow.add_node("search_flight", search_flight_node)
+workflow.add_node("select_flight", select_flight_node)
+workflow.add_node("pay_flight", pay_flight_node)
+workflow.add_node("search_hotel", search_hotel_node)
+workflow.add_node("select_hotel", select_hotel_node)
+workflow.add_node("pay_hotel", pay_hotel_node)
+
+workflow.add_node("summary", generate_summary_node)
+workflow.add_node("check_weather", check_weather_node)
+workflow.add_node("side_chat", side_chat_node)
+workflow.add_node("guide", guide_node)
 
 workflow.add_edge(START, "intent_router")
 
-# 路由逻辑
+# 【核心路由逻辑 - 显式直连版】
 
 
 def route_next_step(state: TravelState):
     decision = state.get("router_decision", "continue")
     step = state.get("step", "collect")
 
-    if decision == "modify":
-        return "modify"
+    print(f"🔄 [Route] step={step}, decision={decision}")
+
+    # 1. 全局中断意图
+    if decision == "confirm_plan":
+        return "search_flight"  # Start flight search after plan confirmation
+    if decision == "update_info":
+        return "collect"
     if decision == "side_chat":
         return "side_chat"
-    if decision == "check_weather":  # 新增路由分支
+    if decision == "check_weather":
         return "check_weather"
 
-    # 正常流程流转
-    if step == "wait_payment" and decision == "continue":
-        # 如果在支付阶段，且用户说"好的/确认"，则进入支付处理
-        return "process_payment"
-
-    # 防止 step 为 finish 时返回 "finish" 导致崩溃
-    # 注意：下面的 conditional edges 必须包含这里返回的所有可能值
-    return step
-
-
-workflow.add_conditional_edges(
-    "intent_router",
-    route_next_step,
-    {
-        "modify": "modify",
-        "side_chat": "side_chat",
-        "check_weather": "check_weather",
-        "collect": "collect",
-        "plan": "plan",
-        "review": "review",
-        "searching": "search_realtime",
-        "selecting": "execute_select",
-        "wait_payment": "intent_router",  # 循环等待确认
-        "process_payment": "process_payment",
-        "finish": "side_chat"  # 修复崩溃的关键：当状态为 finish 时，后续 continue 操作流转到 side_chat
-    }
-)
-
-
-# 新增：收集完成后自动流转到 Plan 节点的逻辑
-def route_after_collect(state: TravelState):
-    if state.get("step") == "plan":
+    # 2. 正常流程
+    if step == "collect":
+        return "collect"
+    elif step == "plan":
         return "plan"
-    return END
+    elif step == "choose_plan":
+        return "side_chat"
 
-# 新增：Review 选定方案后，自动流转到 Search Realtime 节点
+    # Flight Flow
+    elif step == "search_flight":
+        return "search_flight"  # Should not happen if node returns select_flight, but for safety
+    elif step == "select_flight":
+        return "select_flight"
+    elif step == "pay_flight":
+        return "pay_flight"
+
+    # Hotel Flow
+    elif step == "search_hotel":
+        return "search_hotel"
+    elif step == "select_hotel":
+        return "select_hotel"
+    elif step == "pay_hotel":
+        return "pay_hotel"
+
+    elif step == "summary":
+        return "side_chat"
+    elif step == "finish":
+        return "side_chat"
+
+    return "side_chat"
 
 
-def route_after_review(state: TravelState):
-    if state.get("step") == "searching":
-        return "searching"
-    return END
+# 【核心字典映射】
+workflow.add_conditional_edges("intent_router", route_next_step, {
+    "collect": "collect",
+    "plan": "plan",
+    "search_flight": "search_flight",
+    "select_flight": "select_flight",
+    "pay_flight": "pay_flight",
+    "search_hotel": "search_hotel",
+    "select_hotel": "select_hotel",
+    "pay_hotel": "pay_hotel",
+    "side_chat": "side_chat",
+    "check_weather": "check_weather",
+})
 
-# 新增：支付后的流转逻辑 (循环检测)
+# 后置连接逻辑
+workflow.add_conditional_edges("collect", lambda s: "plan" if s.get(
+    "step") == "plan" else END, {"plan": "plan", END: END})
 
+workflow.add_edge("plan", "guide")
 
-def route_after_payment(state: TravelState):
-    step = state.get("step")
-    if step == "finish":
-        return END  # 结束本次流程，等待用户新输入（被Router转去side_chat）
-    elif step == "selecting":
-        return END  # 结束本次Turn，等待用户输入（被Router转去execute_select）
-    return END
+# Flight Flow Edges
+workflow.add_edge("search_flight", END)
+workflow.add_edge("select_flight", END)
+workflow.add_conditional_edges("pay_flight", lambda s: "search_hotel" if s.get(
+    "step") == "search_hotel" else "guide", {"search_hotel": "search_hotel", "guide": "guide"})
 
+# Hotel Flow Edges
+workflow.add_edge("search_hotel", END)
+workflow.add_edge("select_hotel", END)
+workflow.add_conditional_edges("pay_hotel", lambda s: "summary" if s.get(
+    "step") == "summary" else "guide", {"summary": "summary", "guide": "guide"})
 
-# 结束边
-workflow.add_edge("side_chat", END)
-workflow.add_edge("check_weather", END)
-# workflow.add_edge("collect", END)  <-- 已删除，改为下方条件边
-workflow.add_conditional_edges(
-    "collect", route_after_collect, {"plan": "plan", END: END})
-
-# workflow.add_edge("review", END) <-- 已删除，改为下方条件边 (修复您的流程中断问题)
-workflow.add_conditional_edges(
-    "review", route_after_review, {"searching": "search_realtime", END: END})
-
-workflow.add_edge("search_realtime", END)
-workflow.add_edge("execute_select", END)  # 选完后暂停，等用户确认
-
-# process_payment 需要条件跳转，因为可能还没完
-workflow.add_conditional_edges(
-    "process_payment", route_after_payment, {END: END})
-
-workflow.add_conditional_edges("modify", route_after_modify, {
-                               "plan": "plan", END: END})
-workflow.add_edge("plan", END)
+workflow.add_edge("check_weather", "guide")
+workflow.add_edge("summary", END)
+workflow.add_edge("side_chat", "guide")
+workflow.add_edge("guide", END)
 
 memory = MemorySaver()
-travel_agent = workflow.compile(
-    checkpointer=memory,
-    interrupt_before=[]
-)
+travel_agent = workflow.compile(checkpointer=memory)

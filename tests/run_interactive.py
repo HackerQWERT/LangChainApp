@@ -2,7 +2,7 @@ import asyncio
 import sys
 import os
 
-# 1. 确保项目根目录在 sys.path 中
+# 1. 确保项目根目录在 sys.path 中【‘
 sys.path.append(os.getcwd())
 
 try:

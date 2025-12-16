@@ -8,37 +8,33 @@ graph TD;
 	intent_router(intent_router)
 	collect(collect)
 	plan(plan)
-	review(review)
 	search_realtime(search_realtime)
 	execute_select(execute_select)
 	process_payment(process_payment)
-	side_chat(side_chat)
+	summary(summary)
 	check_weather(check_weather)
-	modify(modify)
+	side_chat(side_chat)
+	guide(guide)
 	__end__([<p>__end__</p>]):::last
 	__start__ --> intent_router;
+	check_weather --> guide;
 	collect -.-> __end__;
 	collect -.-> plan;
 	intent_router -.-> check_weather;
 	intent_router -.-> collect;
-	intent_router -. &nbsp;selecting&nbsp; .-> execute_select;
-	intent_router -.-> modify;
+	intent_router -.-> execute_select;
 	intent_router -.-> plan;
 	intent_router -.-> process_payment;
-	intent_router -.-> review;
-	intent_router -. &nbsp;searching&nbsp; .-> search_realtime;
-	intent_router -. &nbsp;finish&nbsp; .-> side_chat;
-	modify -.-> __end__;
-	modify -.-> plan;
-	process_payment -.-> __end__;
-	review -.-> __end__;
-	review -. &nbsp;searching&nbsp; .-> search_realtime;
-	check_weather --> __end__;
+	intent_router -.-> search_realtime;
+	intent_router -.-> side_chat;
+	plan --> guide;
+	process_payment -.-> guide;
+	process_payment -.-> summary;
+	side_chat --> guide;
 	execute_select --> __end__;
-	plan --> __end__;
+	guide --> __end__;
 	search_realtime --> __end__;
-	side_chat --> __end__;
-	intent_router -. &nbsp;wait_payment&nbsp; .-> intent_router;
+	summary --> __end__;
 	classDef default fill:#f2f0ff,line-height:1.2
 	classDef first fill-opacity:0
 	classDef last fill:#bfb6fc

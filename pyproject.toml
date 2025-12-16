@@ -33,6 +33,7 @@ dependencies = [
     "tavily-python>=0.7.14",
     "langsmith>=0.3.45",
     "google-search-results>=2.4.2",
+    "airportsdata>=20250909",
 ]
 
 [dependency-groups]
@@ -44,3 +45,6 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = "."
 testpaths = ["tests"]
+addopts = "-s"
+log_cli = true
+log_level = "DEBUG"
