@@ -87,3 +87,55 @@ LangGraph 状态机包含以下核心节点，负责不同的业务逻辑：
 | `check_weather` | **天气查询**。提取地点并调用天气 API。 | Text |
 | `side_chat` | **智能闲聊**。处理非业务指令，提供人性化的对话互动。 | Stream Text |
 | `guide` | **流程引导**。在每个步骤结束后，生成简短的下一步操作提示。 | Text (Buffered) |
+
+## 🚀 开发指南 (Developer Guide)
+
+### 🏗️ 架构概述 (Architecture Overview)
+
+- **框架**: FastAPI (`app/main.py`) 通过 Uvicorn 提供服务。
+- **代理引擎**: LangGraph (`app/infras/agent/travel_agent.py`) 管理状态和流程。
+- **目录结构**:
+  - `app/infras/agent/`: 核心代理逻辑、图定义和运行器。
+  - `app/infras/func/`: 代理工具和函数（代理的“技能”）。
+  - `app/infras/third_api/`: 外部 API 包装器（Amadeus、OpenWeather、Tavily）。
+  - `app/infras/rag/`: RAG 实现（GraphRAG、AgenticRAG）。
+  - `app/router/`: FastAPI 路由处理器。
+  - `tests/`: Pytest 测试套件。
+
+### 🚀 开发工作流程 (Development Workflow)
+
+- **运行服务器**: 执行 `python start.py`。这将在 `http://localhost:8000` 启动 API。
+  - API 文档: `http://localhost:8000/scalar/v1` 或 `/docs`。
+- **运行测试**: 使用 `pytest`。配置在 `pyproject.toml` 中。
+- **依赖管理**: 依赖项列在 `pyproject.toml` 中。
+
+### 🧩 代理开发模式 (Agent Development Patterns)
+
+#### 1. 定义代理 (LangGraph)
+- 代理在 `app/infras/agent/travel_agent.py` 中定义为 `StateGraph`。
+- 使用 `TypedDict` 或 Pydantic 模型作为图状态。
+- **流式**: 项目使用 `app/infras/agent/agent_runner.py` 中的自定义 SSE (Server-Sent Events) 实现。
+  - `sse_chat_stream`: 处理前端的协议适配。
+  - `run_chat_stream`: 控制台流式调试。
+
+#### 2. 添加工具
+1. **实现逻辑**: 在 `app/infras/func/` 中创建函数。
+2. **外部调用**: 如果调用外部 API，将低级包装器放在 `app/infras/third_api/` 中。
+3. **注册**: 在 `app/infras/agent/travel_agent.py` 中导入并添加到代理的工具节点。
+
+#### 3. RAG 集成
+- RAG 组件位于 `app/infras/rag/`。
+- `GraphRag.py` 和 `AgenticRag.py` 建议高级检索策略。
+
+### 📝 编码约定 (Coding Conventions)
+
+- **Async/Await**: 代码库大量使用异步（FastAPI + LangChain 异步方法）。路由处理器和代理节点始终使用 `async def`。
+- **类型提示**: 广泛使用 Python 类型提示。
+- **配置**: 通过 `python-dotenv` 加载环境变量。确保 `.env` 文件存在（见 `app/infras/agent/travel_agent.py` 中的密钥，如 `AZURE_OPENAI_API_KEY`）。
+- **错误处理**: 代理运行器应捕获异常，以防止流式期间服务器崩溃。
+
+### 🔍 关键文件 (Key Files)
+- `start.py`: 开发服务器入口点。
+- `app/infras/agent/travel_agent.py`: 主代理图定义。
+- `app/infras/agent/agent_runner.py`: 流式逻辑（SSE 和控制台）。
+- `app/router/agent_router.py`: 处理代理请求的端点。
