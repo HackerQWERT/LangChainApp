@@ -1,4 +1,5 @@
 from datetime import datetime, date, timedelta
+from dotenv import load_dotenv
 import pytest
 import os
 from app.infras.func.agent_func import search_flights, search_travel_guides, lookup_airport_code
@@ -6,6 +7,14 @@ import logging
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def load_serpapi_key():
+    if not os.environ.get("SERPAPI_API_KEY"):
+        # Try to load from .env if not in environment
+        from dotenv import load_dotenv
+        load_dotenv()
 
 
 @pytest.mark.asyncio
@@ -19,12 +28,6 @@ async def test_lookup_airport_code():
 
 @pytest.mark.asyncio
 async def test_search_flights():
-    # Ensure API key is present (optional check, but good for debugging)
-    if not os.environ.get("SERPAPI_API_KEY"):
-        # Try to load from .env if not in environment
-        from dotenv import load_dotenv
-        load_dotenv()
-
     if not os.environ.get("SERPAPI_API_KEY"):
         pytest.skip("SERPAPI_API_KEY not set, skipping integration test")
 
@@ -52,7 +55,7 @@ async def test_search_google_flights():
         "return_date": "2025-12-23",
         "currency": "USD",
         "hl": "en",
-        "api_key": "0839ba9a2674eaa69fd366cda65e78d0802cb4600e4b4656efc45d74564b941f"
+        "api_key": os.environ.get("SERPAPI_API_KEY")
     }
 
     search = GoogleSearch(params)
@@ -70,7 +73,7 @@ async def test_search_google_hotels():
         "check_out_date": "2025-12-23",
         "currency": "USD",
         "hl": "en",
-        "api_key": "0839ba9a2674eaa69fd366cda65e78d0802cb4600e4b4656efc45d74564b941f"
+        "api_key": os.environ.get("SERPAPI_API_KEY")
     }
     search = GoogleSearch(params)
     results = search.get_dict()
