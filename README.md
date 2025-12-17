@@ -47,26 +47,26 @@
 | `error` | 错误信息 | `{"message": "API 调用失败..."}` | 展示错误 Toast 或警告。 |
 
 **流式策略 (Streaming Strategy):**
-- **白名单流式**: 仅 `summary` (总结) 和 `side_chat` (闲聊) 节点开启打字机效果。
-- **结构化缓冲**: `plan`, `collect`, `guide` 等输出 JSON 的节点，会在后端缓冲完整后，通过 `message` (is_stream=false) 或 `control` 事件一次性发送，防止前端显示 JSON 乱码。
+- **全缓冲模式 (Full Buffering)**: 为确保前端展示的稳定性，目前所有节点（包括 `summary` 和 `side_chat`）均采用 `on_chain_end` 事件触发输出。
+- **格式化输出**: 后端已针对 Markdown 渲染进行了优化，确保段落分明 (`\n\n`)，并使用 Emoji 和卡片式排版增强可读性。
 
 **详细节点流式配置表:**
 
-| 节点名 | 输出类型 | 应该流式 (Streaming) | 应该等待 (OnChainEnd) | 原因 |
-| :--- | :--- | :--- | :--- | :--- |
-| `intent_router` | Structured (JSON) | ❌ | ❌ | 内部路由逻辑，无需展示 |
-| `collect` | Structured (JSON) | ❌ | ✅ | 输出 JSON，需解析后展示 |
-| `plan` | Structured (JSON) | ❌ | ✅ | 输出复杂 JSON (方案列表)，需解析 |
-| `search_flight` | Tool + Text | ❌ | ✅ | 输出包含 API 数据，需解析 |
-| `select_flight` | Structured (JSON) | ❌ | ✅ | 内部决策逻辑，输出确认文本 |
-| `pay_flight` | Tool + Text | ❌ | ✅ | 支付结果，短文本 |
-| `search_hotel` | Tool + Text | ❌ | ✅ | 同机票搜索 |
-| `select_hotel` | Structured (JSON) | ❌ | ✅ | 同机票选择 |
-| `pay_hotel` | Tool + Text | ❌ | ✅ | 同机票支付 |
-| `summary` | Pure Text | ✅ | ❌ | 纯文本生成，适合打字机效果 |
-| `check_weather` | Structured (JSON) | ❌ | ✅ | 内部先提取 JSON 再调用工具 |
-| `side_chat` | Pure Text | ✅ | ❌ | 纯文本闲聊，适合打字机效果 |
-| `guide` | Structured (JSON) | ❌ | ✅ | 输出 JSON，不能流式！ |
+| 节点名 | 输出类型 | 处理方式 | 原因 |
+| :--- | :--- | :--- | :--- |
+| `intent_router` | Structured (JSON) | 内部处理 | 路由逻辑，无需展示 |
+| `collect` | Structured (JSON) | Buffered | 输出 JSON，需解析后展示 |
+| `plan` | Structured (JSON) | Buffered | 输出复杂 JSON (方案列表)，需解析 |
+| `search_flight` | Tool + Text | Buffered | 输出包含 API 数据，需解析 |
+| `select_flight` | Structured (JSON) | Buffered | 内部决策逻辑，输出确认文本 |
+| `pay_flight` | Tool + Text | Buffered | 支付结果，短文本 |
+| `search_hotel` | Tool + Text | Buffered | 同机票搜索 |
+| `select_hotel` | Structured (JSON) | Buffered | 同机票选择 |
+| `pay_hotel` | Tool + Text | Buffered | 同机票支付 |
+| `summary` | Pure Text | Buffered | 确保完整生成后再发送，避免断流 |
+| `check_weather` | Structured (JSON) | Buffered | 内部先提取 JSON 再调用工具 |
+| `side_chat` | Pure Text | Buffered | 确保完整生成后再发送 |
+| `guide` | Structured (JSON) | Buffered | 输出 JSON，不能流式！ |
 
 ### 9. 🧩 核心节点说明 (Graph Nodes)
 
