@@ -265,6 +265,7 @@ async def search_hotels(location: str, check_in: str, check_out: str = "unknown"
         parsed_hotels = []
         for hotel in properties[:5]:
             name = hotel.get("name", "Unknown Hotel")
+            description = hotel.get("description", "")
 
             # 提取价格
             rate_info = hotel.get("rate_per_night", {})
@@ -282,17 +283,24 @@ async def search_hotels(location: str, check_in: str, check_out: str = "unknown"
             # 提取链接
             link = hotel.get("link")
 
-            # 提取设施 (前3个)
-            amenities = hotel.get("amenities", [])[:3]
+            # 提取图片
+            images = hotel.get("images", [])
+            thumbnail = images[0].get("thumbnail") if images else None
+
+            # 提取设施 (前5个)
+            amenities = hotel.get("amenities", [])[:5]
             amenities_str = ", ".join(amenities) if amenities else "N/A"
 
             item = {
                 "name": name,
+                "description": description,
                 "price": price,
-                "rating": f"{rating} ({reviews} reviews)",
+                "rating": rating,
+                "reviews": reviews,
                 "class": f"{hotel_class} Star" if str(hotel_class).isdigit() else str(hotel_class),
                 "amenities": amenities_str,
-                "link": link
+                "link": link,
+                "thumbnail": thumbnail
             }
             parsed_hotels.append(item)
 

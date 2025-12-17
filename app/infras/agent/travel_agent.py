@@ -250,7 +250,7 @@ async def generate_plans_node(state: TravelState):
     res = await structured_llm.ainvoke([HumanMessage(content=prompt)])
 
     plans_data = [p.dict() for p in res.plans]
-    pretty_msg = res.reply_text + "\n" + \
+    pretty_msg = "\n\n" + res.reply_text + "\n" + \
         "\n".join(
             [f"方案 {i}: {p.name} ({p.price_estimate})" for i, p in enumerate(res.plans)])
 
@@ -321,7 +321,7 @@ async def search_flight_node(state: TravelState):
     except:
         raw_flights = [{"error": str(flight_res)}]
 
-    msg = f"已为您查询到 {origin_code} -> {dest_code} 的机票：\n"
+    msg = f"已为您查询到 {origin_code} -> {dest_code} 的机票：\n\n"
     if isinstance(raw_flights, list) and len(raw_flights) > 0 and "error" not in raw_flights[0]:
         for i, f in enumerate(raw_flights[:5]):
             airline = f.get('airline', '未知航司')
@@ -332,15 +332,15 @@ async def search_flight_node(state: TravelState):
             price = f.get('price', '未知价格')
             link = f.get('link')
 
-            msg += f"**[F{i+1}] {airline}**\n"
-            msg += f"   - 航班: {fnum}\n"
-            msg += f"   - 价格: {price}\n"
-            msg += f"   - 出发: {dept}\n"
-            msg += f"   - 到达: {arr}\n"
-            msg += f"   - 时长: {dur}\n"
+            msg += f"### [F{i+1}] {airline}\n"
+            msg += f"- **✈️ 航班**: {fnum}\n"
+            msg += f"- **💰 价格**: {price}\n"
+            msg += f"- **🛫 出发**: {dept}\n"
+            msg += f"- **🛬 到达**: {arr}\n"
+            msg += f"- **⏱️ 时长**: {dur}\n"
             if link:
-                msg += f"   - 链接: {link}\n"
-            msg += "\n"
+                msg += f"- [🔗 预订链接]({link})\n"
+            msg += "\n---\n"
     else:
         err_msg = raw_flights[0].get('error') if isinstance(
             raw_flights, list) else "No data"
@@ -454,11 +454,33 @@ async def search_hotel_node(state: TravelState):
     except:
         raw_hotels = [{"error": str(hotel_res)}]
 
-    msg = f"已为您查询到 {dest_raw} 的酒店：\n"
+    msg = f"\n\n已为您查询到 {dest_raw} 的酒店：\n\n"
     if isinstance(raw_hotels, list) and len(raw_hotels) > 0 and "error" not in raw_hotels[0]:
         for i, h in enumerate(raw_hotels[:5]):
             hname = h.get('name') or h.get('id', 'N/A')
-            msg += f"- **[H{i+1}] {hname}**: {h.get('price', 'N/A')}\n"
+            price = h.get('price', 'N/A')
+            rating = h.get('rating', 'N/A')
+            reviews = h.get('reviews', 0)
+            h_class = h.get('class', 'N/A')
+            amenities = h.get('amenities', 'N/A')
+            link = h.get('link')
+            thumb = h.get('thumbnail')
+            desc = h.get('description', '')
+
+            msg += f"### [H{i+1}] {hname}\n"
+            if thumb:
+                msg += f"![{hname}]({thumb})\n"
+
+            msg += f"- **💰 价格**: {price}\n"
+            msg += f"- **⭐ 评分**: {rating} ({reviews} 条评价)\n"
+            msg += f"- **🏨 等级**: {h_class}\n"
+            if amenities and amenities != "N/A":
+                msg += f"- **🛁 设施**: {amenities}\n"
+            if desc:
+                msg += f"> {desc[:100]}...\n"
+            if link:
+                msg += f"- [🔗 查看详情]({link})\n"
+            msg += "\n---\n"
     else:
         msg += "未查询到结构化酒店信息。\n"
 
@@ -592,6 +614,7 @@ async def generate_summary_node(state: TravelState):
     """
 
     ai_msg = await llm.ainvoke([HumanMessage(content=prompt)])
+    ai_msg.content = "\n\n" + str(ai_msg.content)
 
     return {"step": "finish", "messages": [ai_msg]}
 
@@ -621,12 +644,33 @@ async def check_weather_node(state: TravelState):
 
     # 2. 真实调用
     try:
-        report = await get_weather.ainvoke({"location": loc, "date": date_param})
+        raw_report = await get_weather.ainvoke({"location": loc, "date": date_param})
     except Exception as e:
-        report = f"无法获取天气: {e}"
+        raw_report = f"无法获取天气: {e}"
 
-    date_info = f" ({date_param})" if date_param else ""
-    return {"messages": [AIMessage(content=f"【{loc}{date_info}】天气报告: {report}")]}
+    # 3. 格式化输出
+    format_prompt = f"""
+    你是一名贴心的旅行助手。请将以下原始天气数据转换为用户友好的 Markdown 格式。
+    
+    📍 地点: {loc}
+    📅 日期: {date_param if date_param else "近期预报"}
+    📝 原始数据: {raw_report}
+    
+    要求:
+    1. 使用 Emoji 图标 (☀️, 🌧️, 🌡️ 等) 增强可读性。
+    2. 提取关键信息：天气状况、最高/最低温。
+    3. 给出一条简短的穿衣或出行建议。
+    4. 格式示例:
+       ### 🌤️ {loc} 天气预报
+       - **日期**: 2025-11-25
+       - **天气**: 小雨 🌧️
+       - **温度**: 4°C - 12°C
+       > 💡 建议: 出门记得带伞，早晚温差大请注意保暖。
+    """
+
+    formatted_msg = await llm.ainvoke([HumanMessage(content=format_prompt)])
+
+    return {"messages": [formatted_msg]}
 
 
 async def side_chat_node(state: TravelState):
@@ -650,10 +694,34 @@ async def side_chat_node(state: TravelState):
 
 
 async def guide_node(state: TravelState):
-    step = state.get("step")
-    prompt = f"步骤: {step}。给用户一句简短引导。"
+    step = state.get("step", "collect")
+
+    # 明确每个阶段的引导话术目标
+    goals = {
+        "collect": "引导用户补充完善 目的地/出发地/日期 信息。",
+        "plan": "引导用户查看生成的方案。",
+        "choose_plan": "引导用户从方案中做出选择 (例如输入 '方案1')。",
+        "search_flight": "告知用户正在搜寻机票。",
+        "select_flight": "引导用户从列表中选择机票 (例如输入 'F1')。",
+        "pay_flight": "引导用户确认支付 (输入 '确认' 或 '支付')。",
+        "search_hotel": "告知用户正在搜寻酒店。",
+        "select_hotel": "引导用户从列表中选择酒店 (例如输入 'H1')。",
+        "pay_hotel": "引导用户确认支付 (输入 '确认' 或 '支付')。",
+        "summary": "询问用户是否满意或有其他需求。",
+        "finish": "礼貌结束对话。"
+    }
+
+    current_goal = goals.get(step, "引导用户进行下一步操作。")
+
+    prompt = f"""
+    当前主流程步骤: {step}
+    引导目标: {current_goal}
+    
+    任务: 生成一句简短、清晰的引导语 (20字以内)，明确告诉用户接下来该做什么。
+    不要重复之前的长篇大论，直接给行动指令。
+    """
     res = await llm.with_structured_output(GuideOutput).ainvoke([HumanMessage(prompt)])
-    return {"messages": [AIMessage(f"💁 {res.guidance}")]}
+    return {"messages": [AIMessage(f"\n\n💁 {res.guidance}")]}
 
 
 # --- 4. 构建图与路由逻辑 ---

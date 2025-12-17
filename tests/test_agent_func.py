@@ -31,8 +31,8 @@ async def test_search_flights():
     if not os.environ.get("SERPAPI_API_KEY"):
         pytest.skip("SERPAPI_API_KEY not set, skipping integration test")
 
-    departure = "PEK"
-    arrival = "LAX"
+    departure = "PVG"
+    arrival = "NYS"
     date_str = (date.today() + timedelta(days=1)).strftime("%Y-%m-%d")
     return_date_str = (date.today() + timedelta(days=7)).strftime("%Y-%m-%d")
 
