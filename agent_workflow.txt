@@ -8,9 +8,12 @@ graph TD;
 	intent_router(intent_router)
 	collect(collect)
 	plan(plan)
-	search_realtime(search_realtime)
-	execute_select(execute_select)
-	process_payment(process_payment)
+	search_flight(search_flight)
+	select_flight(select_flight)
+	pay_flight(pay_flight)
+	search_hotel(search_hotel)
+	select_hotel(select_hotel)
+	pay_hotel(pay_hotel)
 	summary(summary)
 	check_weather(check_weather)
 	side_chat(side_chat)
@@ -22,18 +25,25 @@ graph TD;
 	collect -.-> plan;
 	intent_router -.-> check_weather;
 	intent_router -.-> collect;
-	intent_router -.-> execute_select;
+	intent_router -.-> pay_flight;
+	intent_router -.-> pay_hotel;
 	intent_router -.-> plan;
-	intent_router -.-> process_payment;
-	intent_router -.-> search_realtime;
+	intent_router -.-> search_flight;
+	intent_router -.-> search_hotel;
+	intent_router -.-> select_flight;
+	intent_router -.-> select_hotel;
 	intent_router -.-> side_chat;
+	pay_flight -.-> guide;
+	pay_flight -.-> search_hotel;
+	pay_hotel -.-> guide;
+	pay_hotel -.-> summary;
 	plan --> guide;
-	process_payment -.-> guide;
-	process_payment -.-> summary;
 	side_chat --> guide;
-	execute_select --> __end__;
 	guide --> __end__;
-	search_realtime --> __end__;
+	search_flight --> __end__;
+	search_hotel --> __end__;
+	select_flight --> __end__;
+	select_hotel --> __end__;
 	summary --> __end__;
 	classDef default fill:#f2f0ff,line-height:1.2
 	classDef first fill-opacity:0
