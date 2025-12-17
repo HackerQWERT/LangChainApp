@@ -1,4 +1,5 @@
 import asyncio
+import json
 from langchain_core.messages import HumanMessage
 
 
@@ -77,3 +78,95 @@ async def run_chat_stream(agent_graph, user_input: str, user_id: str = "default_
         print(f"\n❌ 运行过程中发生错误: {e}")
 
     print("\n" + "-" * 60)
+
+
+async def sse_chat_stream(agent_graph, input_payload: dict, config: dict):
+    """
+    SSE (Server-Sent Events) 生成器。
+    实现了明确的前后端通信协议 (Protocol Adapter)。
+
+    Protocol Definition:
+    - event: message  -> 聊天气泡文本 (data: {content: "...", is_stream: bool})
+    - event: control  -> 前端交互组件 (data: {type: "select_plan", options: [...]})
+    - event: status   -> 状态/Loading提示 (data: {content: "..."})
+    - event: error    -> 错误信息 (data: {message: "..."})
+    """
+
+    # --- 辅助函数: 统一 SSE 格式 ---
+    def create_event(event_type: str, payload: dict):
+        return f"event: {event_type}\ndata: {json.dumps(payload)}\n\n"
+
+    # --- 配置: 允许流式输出文本的节点 ---
+    # 这些节点的 LLM 输出是纯文本，适合直接打字机展示
+    ALLOW_STREAMING_NODES = {"summary", "side_chat"}
+
+    try:
+        # 监听 LangGraph 的细粒度事件
+        async for event in agent_graph.astream_events(input_payload, version="v2", config=config):
+            kind = event["event"]
+            node_name = event.get("name", "")
+
+            # --- 1. 状态反馈 (Status Feedback) ---
+            # 目的: 缓解用户等待焦虑，显示系统当前动作
+            if kind == "on_chain_start":
+                if node_name in ["collect", "plan", "search_flight", "search_hotel"]:
+                    yield create_event("status", {"content": "🤔 正在思考...", "node": node_name})
+
+            elif kind == "on_tool_start" and not node_name.startswith("_"):
+                yield create_event("status", {"content": f"⚙️ 调用工具: {node_name}...", "node": node_name})
+
+            # --- 2. 实时文本流 (Real-time Text Streaming) ---
+            # 目的: 提供打字机效果。仅对白名单节点开放，防止 JSON 源码泄露。
+            elif kind == "on_chat_model_stream":
+                if node_name in ALLOW_STREAMING_NODES:
+                    chunk = event["data"]["chunk"]
+                    if hasattr(chunk, "content") and chunk.content:
+                        yield create_event("message", {"content": chunk.content, "is_stream": True})
+
+            # --- 3. 节点结果处理 (Node Result Processing) ---
+            # 目的: 节点执行结束后，根据节点类型，决定发送什么结构化数据给前端
+            elif kind == "on_chain_end":
+                output = event["data"].get("output")
+                if not output or not isinstance(output, dict):
+                    continue
+
+                # === 策略 A: 方案生成节点 ===
+                if node_name == "plan":
+                    # 1. 发送交互指令: 弹出方案选择卡片
+                    plans = output.get("generated_plans", [])
+                    if plans:
+                        yield create_event("control", {"type": "select_plan", "options": plans})
+                    # 2. 发送文本回复
+                    if msgs := output.get("messages"):
+                        yield create_event("message", {"content": msgs[-1].content, "is_stream": False})
+
+                # === 策略 B: 机票搜索节点 ===
+                elif node_name == "search_flight":
+                    options = output.get(
+                        "realtime_options", {}).get("flights", [])
+                    if isinstance(options, list) and options and "error" not in options[0]:
+                        yield create_event("control", {"type": "select_flight", "options": options})
+                    if msgs := output.get("messages"):
+                        yield create_event("message", {"content": msgs[-1].content, "is_stream": False})
+
+                # === 策略 C: 酒店搜索节点 ===
+                elif node_name == "search_hotel":
+                    options = output.get(
+                        "realtime_options", {}).get("hotels", [])
+                    if isinstance(options, list) and options and "error" not in options[0]:
+                        yield create_event("control", {"type": "select_hotel", "options": options})
+                    if msgs := output.get("messages"):
+                        yield create_event("message", {"content": msgs[-1].content, "is_stream": False})
+
+                # === 策略 D: 普通文本节点 (Collect, Pay, Weather) ===
+                # 这些节点通常输出较短的确认信息或 JSON 解析后的文本
+                elif node_name in ["collect", "pay_flight", "pay_hotel", "check_weather", "select_flight", "select_hotel", "guide"]:
+                    if msgs := output.get("messages"):
+                        content = msgs[-1].content
+                        if content:
+                            yield create_event("message", {"content": content, "is_stream": False})
+
+                # 注意: summary 节点已在流式阶段处理，此处忽略，避免重复。
+
+    except Exception as e:
+        yield create_event("error", {"message": str(e)})

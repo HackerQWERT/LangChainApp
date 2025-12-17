@@ -613,9 +613,23 @@ async def check_weather_node(state: TravelState):
 
 
 async def side_chat_node(state: TravelState):
-    if state.get("step") == "choose_plan":
-        return {"messages": [AIMessage("请明确选择一个方案（如：方案1），或者告诉我需要修改什么需求。")]}
-    return {"messages": [AIMessage(f"收到: {state['messages'][-1].content}")]}
+    print("💬 [Node] Side Chat (LLM)...")
+    last_msg = state["messages"][-1].content
+    step = state.get("step", "unknown")
+
+    prompt = f"""
+    你是一个专业的旅行助手。
+    当前状态: {step}
+    用户输入: "{last_msg}"
+    
+    请根据用户输入进行回复：
+    1. 如果用户是在闲聊，请友好互动。
+    2. 如果用户有疑问，请解答。
+    3. 请保持回复简短自然。
+    """
+
+    response = await llm.ainvoke([HumanMessage(content=prompt)])
+    return {"messages": [response]}
 
 
 async def guide_node(state: TravelState):

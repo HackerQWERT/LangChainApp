@@ -10,7 +10,7 @@ from langgraph.types import Command
 from app.infras.agent.travel_agent import travel_agent
 
 # 2. 导入刚刚抽离的执行器逻辑
-from app.infras.agent import run_chat_stream
+from app.infras.agent import run_chat_stream, sse_chat_stream
 
 # 定义 Router
 agent_router = APIRouter()
@@ -59,7 +59,7 @@ async def vibe(req: ChatRequest):
 
     # 3. 调用 Runner 获取生成器
     # 这里我们将 logic 委托给了 agent_runner.py，Router 只负责网络层
-    stream_generator = run_chat_stream(
+    stream_generator = sse_chat_stream(
         agent_graph=travel_agent,
         input_payload=input_payload,
         config=config
