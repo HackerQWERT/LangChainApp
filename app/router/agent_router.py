@@ -3,8 +3,7 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
-from langchain_core.messages import HumanMessage, convert_to_messages
-from langgraph.types import Command
+from langchain_core.messages import HumanMessage
 
 # 1. 导入业务 Agent
 from app.infras.agent.travel_agent import travel_agent
@@ -20,12 +19,7 @@ agent_router = APIRouter()
 
 class ChatRequest(BaseModel):
     thread_id: str          # 会话ID
-    # 场景1：普通对话，只发最新的一句（推荐）
-    message: Optional[str] = None
-    # 场景2：高级对话，发送多条或结构化消息（如包含 system prompt 或 多模态数据）
-    messages: Optional[List[Dict[str, Any]]] = None
-    # 场景3：恢复中断
-    resume_action: Optional[str] = None
+    message: str            # 用户输入文本
 
 # --- API 端点 ---
 
@@ -38,21 +32,7 @@ async def vibe(req: ChatRequest):
     """
 
     # 1. 准备输入数据 (Input Payload)
-    input_payload = {}
-
-    if req.resume_action:
-        # A. 恢复模式
-        input_payload = Command(resume=req.resume_action)
-    elif req.messages:
-        # B. 列表模式
-        converted_msgs = convert_to_messages(req.messages)
-        input_payload = {"messages": converted_msgs}
-    elif req.message:
-        # C. 简单模式
-        input_payload = {"messages": [HumanMessage(content=req.message)]}
-    else:
-        raise HTTPException(
-            status_code=400, detail="Must provide message, messages, or resume_action")
+    input_payload = {"messages": [HumanMessage(content=req.message)]}
 
     # 2. 准备配置 (Config)
     config = {"configurable": {"thread_id": req.thread_id}}

@@ -14,6 +14,7 @@ from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 
+
 # --- 1. 导入真实工具 ---
 try:
     from app.infras.func import (
@@ -87,6 +88,7 @@ class GuideOutput(BaseModel):
 
 class WeatherQuery(BaseModel):
     location: str
+    date: Optional[str] = Field(None, description="YYYY-MM-DD format")
 
 # --- 2. State 定义 ---
 
@@ -598,18 +600,33 @@ async def check_weather_node(state: TravelState):
     """【天气节点】 真实调用 get_weather"""
     print("☀️ [Node] Checking Weather (Real Tool)...")
     last_msg = state["messages"][-1].content
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # 1. 提取城市名和日期
+    prompt = f"""
+    当前时间: {now_str}
+    用户输入: "{last_msg}"
+    
+    任务:
+    1. 提取城市名称，并转换为英文 (如 Beijing, Shanghai)。
+    2. 提取日期，并根据当前时间将相对日期 (如"明天", "下周五") 转换为 YYYY-MM-DD 格式。
+       - 如果用户未提及日期，date 字段留空。
+    """
 
     structured = llm.with_structured_output(WeatherQuery)
-    q = await structured.ainvoke([HumanMessage(f"从这句话提取城市: {last_msg}")])
-    loc = q.location or state.get("destination") or "Beijing"
+    q = await structured.ainvoke([HumanMessage(content=prompt)])
 
-    # 真实调用
+    loc = q.location or state.get("destination") or "Beijing"
+    date_param = q.date
+
+    # 2. 真实调用
     try:
-        report = await get_weather.ainvoke({"location": loc})
+        report = await get_weather.ainvoke({"location": loc, "date": date_param})
     except Exception as e:
         report = f"无法获取天气: {e}"
 
-    return {"messages": [AIMessage(content=f"【{loc}】天气报告: {report}")]}
+    date_info = f" ({date_param})" if date_param else ""
+    return {"messages": [AIMessage(content=f"【{loc}{date_info}】天气报告: {report}")]}
 
 
 async def side_chat_node(state: TravelState):

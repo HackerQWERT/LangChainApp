@@ -94,11 +94,14 @@ async def sse_chat_stream(agent_graph, input_payload: dict, config: dict):
 
     # --- 辅助函数: 统一 SSE 格式 ---
     def create_event(event_type: str, payload: dict):
-        return f"event: {event_type}\ndata: {json.dumps(payload)}\n\n"
+        # ensure_ascii=False 确保中文不被转义为 \uXXXX
+        return f"event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
 
     # --- 配置: 允许流式输出文本的节点 ---
     # 这些节点的 LLM 输出是纯文本，适合直接打字机展示
-    ALLOW_STREAMING_NODES = {"summary", "side_chat"}
+    # 注意: 如果节点使用 invoke/ainvoke 而非 stream，则不会触发 on_chat_model_stream
+    # 为了稳定性，暂时关闭流式，统一使用 on_chain_end 输出
+    ALLOW_STREAMING_NODES = set() 
 
     try:
         # 监听 LangGraph 的细粒度事件
@@ -158,15 +161,13 @@ async def sse_chat_stream(agent_graph, input_payload: dict, config: dict):
                     if msgs := output.get("messages"):
                         yield create_event("message", {"content": msgs[-1].content, "is_stream": False})
 
-                # === 策略 D: 普通文本节点 (Collect, Pay, Weather) ===
+                # === 策略 D: 普通文本节点 (Collect, Pay, Weather, Summary, SideChat) ===
                 # 这些节点通常输出较短的确认信息或 JSON 解析后的文本
-                elif node_name in ["collect", "pay_flight", "pay_hotel", "check_weather", "select_flight", "select_hotel", "guide"]:
+                elif node_name in ["collect", "pay_flight", "pay_hotel", "check_weather", "select_flight", "select_hotel", "guide", "summary", "side_chat"]:
                     if msgs := output.get("messages"):
                         content = msgs[-1].content
                         if content:
                             yield create_event("message", {"content": content, "is_stream": False})
-
-                # 注意: summary 节点已在流式阶段处理，此处忽略，避免重复。
 
     except Exception as e:
         yield create_event("error", {"message": str(e)})
