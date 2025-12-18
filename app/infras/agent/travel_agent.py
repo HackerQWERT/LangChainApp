@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 from langchain_openai import AzureChatOpenAI
 from langchain_core.messages import SystemMessage, HumanMessage, BaseMessage, AIMessage
 from pydantic import BaseModel, Field
-from langgraph.graph import StateGraph, START, END
+from langgraph.graph import StateGraph, START, END, add_messages
 from langgraph.checkpoint.memory import MemorySaver
 
 # --- 规则引擎 ---
@@ -97,7 +97,7 @@ class WeatherQuery(BaseModel):
 
 
 class TravelState(TypedDict):
-    messages: Annotated[List[BaseMessage], operator.add]
+    messages: Annotated[List[BaseMessage], add_messages]
 
     step: Literal[
         "collect",          # 收集信息
