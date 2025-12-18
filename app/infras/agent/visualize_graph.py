@@ -63,17 +63,33 @@ def main():
         svg_file = "agent_workflow.svg"
         generate_svg(mermaid_txt, svg_file)
 
-        # 4. 生成 PNG 图片
-        # draw_mermaid_png() 默认会调用 Mermaid Ink 的 API 生成图片二进制流
+        # 4. 生成 PNG 图片 (尝试多种方式)
         print(f"🎨 正在生成 PNG 预览...")
-        png_data = graph.draw_mermaid_png()
-
+        png_generated = False
         output_file = "agent_workflow.png"
-        with open(output_file, "wb") as f:
-            f.write(png_data)
-
-        print(f"✅ PNG 已保存: {os.path.abspath(output_file)}")
-        print(f"   请在左侧文件列表中打开 {output_file} 或 {svg_file} 查看实际结构。")
+        
+        # 方式1: 尝试使用 API (增加重试)
+        try:
+            from langchain_core.runnables.graph import MermaidDrawMethod
+            png_data = graph.draw_mermaid_png(
+                draw_method=MermaidDrawMethod.API,
+                max_retries=5,
+                retry_delay=2.0
+            )
+            with open(output_file, "wb") as f:
+                f.write(png_data)
+            print(f"✅ PNG 已保存: {os.path.abspath(output_file)}")
+            png_generated = True
+        except Exception as api_err:
+            print(f"⚠️ API 方式失败: {api_err}")
+        
+        # 总结
+        if png_generated:
+            print(f"   请在左侧文件列表中打开 {output_file} 或 {svg_file} 查看实际结构。")
+        else:
+            print(f"\n📋 PNG 生成失败，但 SVG 和 TXT 已生成成功！")
+            print(f"   ✅ SVG 文件: {os.path.abspath(svg_file)} (可在浏览器中直接打开)")
+            print(f"   ✅ TXT 文件: {os.path.abspath(txt_file)} (可复制到 https://mermaid.live 查看)")
 
     except Exception as e:
         print(f"❌ 生成失败: {e}")
