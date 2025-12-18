@@ -18,13 +18,18 @@ graph TD;
 	check_weather(check_weather)
 	side_chat(side_chat)
 	guide(guide)
+	sentinel(sentinel)
+	block(block)
 	__end__([<p>__end__</p>]):::last
 	__start__ --> intent_router;
+	block --> guide;
 	check_weather --> guide;
 	collect -.-> __end__;
 	collect -.-> plan;
+	intent_router -.-> block;
 	intent_router -.-> check_weather;
 	intent_router -.-> collect;
+	intent_router -.-> guide;
 	intent_router -.-> pay_flight;
 	intent_router -.-> pay_hotel;
 	intent_router -.-> plan;
@@ -32,12 +37,17 @@ graph TD;
 	intent_router -.-> search_hotel;
 	intent_router -.-> select_flight;
 	intent_router -.-> select_hotel;
+	intent_router -.-> sentinel;
 	intent_router -.-> side_chat;
 	pay_flight -.-> guide;
 	pay_flight -.-> search_hotel;
 	pay_hotel -.-> guide;
 	pay_hotel -.-> summary;
 	plan --> guide;
+	sentinel -.-> block;
+	sentinel -.-> guide;
+	sentinel -.-> pay_flight;
+	sentinel -.-> pay_hotel;
 	side_chat --> guide;
 	guide --> __end__;
 	search_flight --> __end__;
