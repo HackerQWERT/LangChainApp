@@ -30,12 +30,23 @@
 ### 6. ☀️ 天气查询 (Weather Services)
 - **实时天气**：集成 OpenWeather API，提供目的地实时天气报告，辅助出行决策。
 
-### 7. 🏗️ 技术架构特性
+### 7. 🛡️ 安全规则引擎 (Security Rule Engine)
+- **策略模式架构**：基于 `BaseRule` 抽象类实现可扩展的规则系统，支持动态添加新规则。
+- **内置安全规则**：
+  - `PIISafetyRule`：检测身份证号、信用卡号、护照号等敏感信息泄露
+  - `PromptInjectionRule`：防御提示词注入攻击（如"忽略之前的指令"）
+  - `FinancialTransactionRule`：支付步骤风控检查
+  - `NightCurfewRule`：夜间 (23:00-06:00) 预订限制
+  - `SensitiveLocationRule`：敏感地区预订拦截
+- **三级响应机制**：`PASS`（放行）、`BLOCK`（拦截）、`REVIEW`（人工审核，可选启用）
+- **哨兵节点**：在支付等关键步骤前自动执行规则检查
+
+### 8. 🏗️ 技术架构特性
 - **RAG 增强检索**：包含 `GraphRag` 和 `AgenticRag` 实现，支持基于知识图谱的高级检索。
 - **SSE 实时流式交互**：支持 Server-Sent Events 协议，实现打字机效果及前端交互组件（如卡片选择）的实时推送。
 - **可视化调试**：提供控制台流式输出，清晰展示 Agent 的思考过程 (Thinking Process) 和工具调用。
 
-### 8. 📡 SSE 通信协议 (API Protocol)
+### 9. 📡 SSE 通信协议 (API Protocol)
 
 后端通过 `/vibe/stream` 接口提供 Server-Sent Events (SSE) 流式响应，前端需根据 `event` 类型进行不同渲染：
 
@@ -43,6 +54,7 @@
 | :--- | :--- | :--- | :--- |
 | `message` | 文本消息 | `{"content": "你好...", "is_stream": true}` | 统一执行**追加**逻辑。`is_stream` 标识是否为打字机字符流。 |
 | `control` | 交互组件 | `{"type": "select_plan", "options": [...]}` | 渲染对应的 UI 组件（如方案选择卡片、机票列表）。 |
+| `control` | 安全拦截 | `{"type": "blocked", "reason": "检测到敏感信息"}` | 展示拦截警告，提示用户操作被阻止。 |
 | `status` | 状态提示 | `{"content": "🤔 正在思考...", "node": "plan"}` | 展示 Loading 动画或状态栏提示，缓解等待焦虑。 |
 | `error` | 错误信息 | `{"message": "API 调用失败..."}` | 展示错误 Toast 或警告。 |
 
@@ -67,8 +79,10 @@
 | `check_weather` | Structured (JSON) | Buffered | 内部先提取 JSON 再调用工具 |
 | `side_chat` | Pure Text | Buffered | 确保完整生成后再发送 |
 | `guide` | Structured (JSON) | Buffered | 输出 JSON，不能流式！ |
+| `sentinel` | Internal | Internal | 安全规则检查，无输出 |
+| `block` | Text | Buffered | 拦截提示信息 |
 
-### 9. 🧩 核心节点说明 (Graph Nodes)
+### 10. 🧩 核心节点说明 (Graph Nodes)
 
 LangGraph 状态机包含以下核心节点，负责不同的业务逻辑：
 
@@ -87,6 +101,8 @@ LangGraph 状态机包含以下核心节点，负责不同的业务逻辑：
 | `check_weather` | **天气查询**。提取地点并调用天气 API。 | Text |
 | `side_chat` | **智能闲聊**。处理非业务指令，提供人性化的对话互动。 | Stream Text |
 | `guide` | **流程引导**。在每个步骤结束后，生成简短的下一步操作提示。 | Text (Buffered) |
+| `sentinel` | **安全哨兵**。在支付等关键步骤前执行规则引擎检查，决定放行或拦截。 | 内部状态 (State Update) |
+| `block` | **拦截处理**。当规则引擎触发拦截时，生成友好的拦截提示并回退流程。 | Text |
 
 ## 🚀 开发指南 (Developer Guide)
 
@@ -95,7 +111,7 @@ LangGraph 状态机包含以下核心节点，负责不同的业务逻辑：
 - **框架**: FastAPI (`app/main.py`) 通过 Uvicorn 提供服务。
 - **代理引擎**: LangGraph (`app/infras/agent/travel_agent.py`) 管理状态和流程。
 - **目录结构**:
-  - `app/infras/agent/`: 核心代理逻辑、图定义和运行器。
+  - `app/infras/agent/`: 核心代理逻辑、图定义、运行器和规则引擎 (`rule.py`)。
   - `app/infras/func/`: 代理工具和函数（代理的“技能”）。
   - `app/infras/third_api/`: 外部 API 包装器（Amadeus、OpenWeather、Tavily）。
   - `app/infras/rag/`: RAG 实现（GraphRAG、AgenticRAG）。
@@ -138,4 +154,5 @@ LangGraph 状态机包含以下核心节点，负责不同的业务逻辑：
 - `start.py`: 开发服务器入口点。
 - `app/infras/agent/travel_agent.py`: 主代理图定义。
 - `app/infras/agent/agent_runner.py`: 流式逻辑（SSE 和控制台）。
+- `app/infras/agent/rule.py`: 安全规则引擎（策略模式实现）。
 - `app/router/agent_router.py`: 处理代理请求的端点。

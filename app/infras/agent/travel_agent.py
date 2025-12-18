@@ -14,6 +14,9 @@ from pydantic import BaseModel, Field
 from langgraph.graph import StateGraph, START, END
 from langgraph.checkpoint.memory import MemorySaver
 
+# --- 规则引擎 ---
+from app.infras.agent.rule import evaluate_state, ActionType
+
 
 # --- 1. 导入真实工具 ---
 try:
@@ -124,6 +127,11 @@ class TravelState(TypedDict):
 
     router_decision: str
 
+    # --- 安全相关字段 ---
+    current_actor: Optional[str]      # "sentinel" | node_name
+    action_type: Optional[str]        # "pass" | "block"
+    risk_reason: Optional[str]        # 拦截原因
+
 # --- 3. 核心节点 ---
 
 
@@ -131,7 +139,6 @@ async def intent_router_node(state: TravelState):
     if not state.get("messages"):
         return {"router_decision": "continue"}
 
-    last_msg = state["messages"][-1].content
     current_step = state.get("step", "collect")
 
     context_info = ""
@@ -144,25 +151,25 @@ async def intent_router_node(state: TravelState):
     elif current_step in ["select_flight", "select_hotel"]:
         context_info = "用户正在选择具体的机票或酒店资源 (如 F1, H1)。这属于 continue 行为，不是 confirm_plan。"
 
-    prompt = f"""
-    我是意图分类器。当前步骤: "{current_step}"。
-    用户输入: "{last_msg}"
-    上下文: {context_info}
-    
-    决策逻辑：
-    1. **confirm_plan**: (仅在 choose_plan 阶段有效) 用户明确选择了旅行方案(如方案1、方案2)。如果当前步骤不是 choose_plan，绝对不要输出 confirm_plan。
-    2. **update_info**: 用户想修改核心信息(地点/时间)。
-    3. **check_weather**: 用户询问天气。
-    4. **side_chat**: 闲聊 或 无效输入。
-    5. **continue**: 用户正在配合当前步骤(如回答问题、选择机票(F1/F2)、确认支付)。
-       - 注意: 如果当前是 select_flight/select_hotel 阶段，用户输入 F1, H1 等代表选择资源，属于 continue。
-    
-    必须输出 decision 和 chosen_index (仅confirm_plan需要)。
-    """
+    system_prompt = f"""你是意图分类器。当前步骤: "{current_step}"。
+上下文: {context_info}
+
+决策逻辑：
+1. **confirm_plan**: (仅在 choose_plan 阶段有效) 用户明确选择了旅行方案(如方案1、方案2)。如果当前步骤不是 choose_plan，绝对不要输出 confirm_plan。
+2. **update_info**: 用户想修改核心信息(地点/时间)。
+3. **check_weather**: 用户询问天气。
+4. **side_chat**: 闲聊 或 无效输入。
+5. **continue**: 用户正在配合当前步骤(如回答问题、选择机票(F1/F2)、确认支付)。
+   - 注意: 如果当前是 select_flight/select_hotel 阶段，用户输入 F1, H1 等代表选择资源，属于 continue。
+
+必须输出 decision 和 chosen_index (仅confirm_plan需要)。"""
+
+    messages_to_send = [SystemMessage(
+        content=system_prompt)] + list(state.get('messages', []))
 
     structured_llm = llm.with_structured_output(RouterOutput)
     try:
-        res: RouterOutput = await structured_llm.ainvoke([HumanMessage(content=prompt)])
+        res: RouterOutput = await structured_llm.ainvoke(messages_to_send)
         decision = res.decision
         chosen_idx = res.chosen_index
     except Exception:
@@ -191,29 +198,48 @@ async def collect_requirements_node(state: TravelState):
 
     current_slots = {k: state.get(k)
                      for k in ["destination", "origin", "dates"]}
-    last_content = state['messages'][-1].content
 
-    # 2. 增强 Prompt: 注入当前时间，并要求精确到天
-    prompt = f"""
-    当前系统时间: {now_str}
-    已收集信息: {json.dumps(current_slots)}
-    用户输入: "{last_content}"
-    
-    任务:
-    1. 更新 destination (目的地), origin (出发地), dates (日期)。
-    2. **日期处理核心规则**: 
-       - 必须利用当前系统时间，将用户的口语时间（如"下周五"、"后天"）转换为标准的 **YYYY-MM-DD** 格式。
-       - 只有当日期明确到 **具体某一天** 时，才算收集完成。如果用户只说了"下个月"或"计划去旅游"，dates 字段必须留空 (null)，并在 reply 中追问具体出发日期。
-    3. **地点处理核心规则**:
-       - 目的地和出发地必须明确到 **具体城市** (如 "东京", "大阪", "纽约")。
-       - 如果用户只提供了国家 (如 "日本", "美国") 或模糊地区，destination/origin 字段必须留空 (null)，并在 reply 中追问具体城市。
-    4. reply: 回复用户。如果缺少必要信息(具体城市/明确日期)，请礼貌追问；如果收集齐全，请确认信息。
-    """
+    # 2. 使用 SystemMessage 指导 LLM 理解对话上下文
+    system_prompt = f"""你是一个旅行信息收集助手。你的任务是从用户的对话中提取旅行信息。
+
+当前系统时间: {now_str}
+已收集信息: {json.dumps(current_slots, ensure_ascii=False)}
+
+**核心语义理解规则 (最重要)**:
+
+1. **"从 X 到 Y" 句式**: X 是出发地 (origin), Y 是目的地 (destination)
+2. **"去 X"**: X 是目的地 (destination)
+3. **"从 X 出发"**: X 是出发地 (origin)
+4. **上下文理解**: 
+   - 如果之前问了"您的出发城市是哪里"，用户回答的城市是 origin
+   - 如果之前问了"要去日本的哪个城市"，用户回答的城市是 destination
+   - 不要把出发地和目的地搞混！
+
+**字段更新规则**:
+- destination: 用户要去的地方，必须是具体城市（国家名如"日本"不算）
+- origin: 用户出发的地方，必须是具体城市
+- dates: 必须转换为 YYYY-MM-DD 格式
+- 如果某个字段已有正确值且用户没有明确要修改，返回 null 表示保留原值
+- 如果用户只说了国家名，对应字段返回 null，在 reply 中追问具体城市
+
+**回复规则**:
+- 如果信息不完整，礼貌追问缺失信息
+- 如果信息完整，确认并总结收集到的信息
+"""
+
+    # 构建消息列表：SystemMessage + 对话历史
+    messages_to_send = [SystemMessage(content=system_prompt)]
+
+    # 添加对话历史 (LangGraph 已经维护了完整的 messages)
+    for msg in state.get('messages', []):
+        messages_to_send.append(msg)
 
     structured_llm = llm.with_structured_output(CollectOutput)
-    res = await structured_llm.ainvoke([HumanMessage(content=prompt)])
+    res = await structured_llm.ainvoke(messages_to_send)
 
     updates = {"messages": [AIMessage(content=res.reply)]}
+
+    # 只在有明确新值时才更新（避免覆盖已有正确值）
     if res.destination:
         updates["destination"] = res.destination
     if res.origin:
@@ -221,9 +247,15 @@ async def collect_requirements_node(state: TravelState):
     if res.dates:
         updates["dates"] = res.dates
 
-    if (res.destination or current_slots["destination"]) and \
-       (res.origin or current_slots["origin"]) and \
-       (res.dates or current_slots["dates"]):
+    # 检查是否所有必要信息都已收集
+    final_destination = res.destination or current_slots["destination"]
+    final_origin = res.origin or current_slots["origin"]
+    final_dates = res.dates or current_slots["dates"]
+
+    print(
+        f"   -> 收集结果: origin={final_origin}, destination={final_destination}, dates={final_dates}")
+
+    if final_destination and final_origin and final_dates:
         updates["step"] = "plan"
     else:
         updates["step"] = "collect"
@@ -241,13 +273,16 @@ async def generate_plans_node(state: TravelState):
         guides_res = f"攻略搜索暂时不可用: {e}"
 
     # 2. 基于攻略生成方案
-    prompt = f"""
-    目的地: {dest}。
-    参考攻略: {str(guides_res)[:800]}。
-    任务: 生成3个差异化的旅行方案（如经济、豪华、亲子）。
-    """
+    system_prompt = f"""你是专业的旅行规划师。
+目的地: {dest}。
+参考攻略: {str(guides_res)[:800]}。
+
+任务: 生成3个差异化的旅行方案（如经济、豪华、亲子）。"""
+
+    messages_to_send = [SystemMessage(
+        content=system_prompt)] + list(state.get('messages', []))
     structured_llm = llm.with_structured_output(PlanGenOutput)
-    res = await structured_llm.ainvoke([HumanMessage(content=prompt)])
+    res = await structured_llm.ainvoke(messages_to_send)
 
     plans_data = [p.dict() for p in res.plans]
     pretty_msg = "\n\n" + res.reply_text + "\n" + \
@@ -357,7 +392,6 @@ async def search_flight_node(state: TravelState):
 
 async def select_flight_node(state: TravelState):
     print("⚙️ [Node] Locking Flight...")
-    last_msg = state["messages"][-1].content
     options = state.get("realtime_options", {})
 
     valid_f = []
@@ -365,17 +399,17 @@ async def select_flight_node(state: TravelState):
         valid_f = [f"[F{i+1}] {f.get('flight_number') or f.get('id')}"
                    for i, f in enumerate(options['flights']) if isinstance(f, dict)]
 
-    prompt = f"""
-    用户输入: "{last_msg}"
-    可选机票列表: {valid_f}
-    
-    任务: 识别用户想选哪个机票。
-    1. 如果用户输入 "F1", "F2" 等编号，请根据列表提取对应的真实 ID (如 "UA 889") 作为 selected_id。
-    2. 输出 action_type: select/skip/invalid。
-    """
+    system_prompt = f"""你是机票选择助手。
+可选机票列表: {valid_f}
 
+任务: 识别用户想选哪个机票。
+1. 如果用户输入 "F1", "F2" 等编号，请根据列表提取对应的真实 ID (如 "UA 889") 作为 selected_id。
+2. 输出 action_type: select/skip/invalid。"""
+
+    messages_to_send = [SystemMessage(
+        content=system_prompt)] + list(state.get('messages', []))
     structured_llm = llm.with_structured_output(SelectionAction)
-    decision = await structured_llm.ainvoke([HumanMessage(content=prompt)])
+    decision = await structured_llm.ainvoke(messages_to_send)
 
     if decision.action_type == "select":
         target_id = decision.selected_id
@@ -495,7 +529,6 @@ async def search_hotel_node(state: TravelState):
 
 async def select_hotel_node(state: TravelState):
     print("⚙️ [Node] Locking Hotel...")
-    last_msg = state["messages"][-1].content
     options = state.get("realtime_options", {})
 
     valid_h = []
@@ -503,17 +536,17 @@ async def select_hotel_node(state: TravelState):
         valid_h = [f"[H{i+1}] {h.get('name') or h.get('id')}"
                    for i, h in enumerate(options['hotels']) if isinstance(h, dict)]
 
-    prompt = f"""
-    用户输入: "{last_msg}"
-    可选酒店列表: {valid_h}
-    
-    任务: 识别用户想选哪个酒店。
-    1. 如果用户输入 "H1", "H2" 等编号，请根据列表提取对应的真实 ID (如 "Hilton") 作为 selected_id。
-    2. 输出 action_type: select/skip/invalid。
-    """
+    system_prompt = f"""你是酒店选择助手。
+可选酒店列表: {valid_h}
 
+任务: 识别用户想选哪个酒店。
+1. 如果用户输入 "H1", "H2" 等编号，请根据列表提取对应的真实 ID (如 "Hilton") 作为 selected_id。
+2. 输出 action_type: select/skip/invalid。"""
+
+    messages_to_send = [SystemMessage(
+        content=system_prompt)] + list(state.get('messages', []))
     structured_llm = llm.with_structured_output(SelectionAction)
-    decision = await structured_llm.ainvoke([HumanMessage(content=prompt)])
+    decision = await structured_llm.ainvoke(messages_to_send)
 
     if decision.action_type == "select":
         target_id = decision.selected_id
@@ -592,28 +625,28 @@ async def generate_summary_node(state: TravelState):
         plan_details = f"方案: {p.get('name')}\n预算: {p.get('price_estimate')}\n详情: {p.get('details')}"
 
     # 2. 生成总结
-    prompt = f"""
-    你是一名专业的旅行管家。请根据以下信息为用户生成一份最终的【旅行行程单】。
-    
-    📍 行程概览:
-    - 目的地: {state.get('destination', '未知')}
-    - 出发日期: {state.get('dates', '待定')}
-    
-    📦 已锁定资源:
-    - ✈️ 航班: {flight_desc}
-    - 🏨 酒店: {hotel_desc}
-    
-    🗺️ 规划参考:
-    {plan_details}
-    
-    要求:
-    1. 语气热情、专业。
-    2. 清晰列出已预订的航班和酒店，**务必包含订单号**以便用户核对。
-    3. 结合用户的规划参考，给出一两句游玩建议。
-    4. 使用 Markdown 格式排版。
-    """
+    system_prompt = f"""你是一名专业的旅行管家。请根据以下信息为用户生成一份最终的【旅行行程单】。
 
-    ai_msg = await llm.ainvoke([HumanMessage(content=prompt)])
+📍 行程概览:
+- 目的地: {state.get('destination', '未知')}
+- 出发日期: {state.get('dates', '待定')}
+
+📦 已锁定资源:
+- ✈️ 航班: {flight_desc}
+- 🏨 酒店: {hotel_desc}
+
+🗺️ 规划参考:
+{plan_details}
+
+要求:
+1. 语气热情、专业。
+2. 清晰列出已预订的航班和酒店，**务必包含订单号**以便用户核对。
+3. 结合用户的规划参考，给出一两句游玩建议。
+4. 使用 Markdown 格式排版。"""
+
+    messages_to_send = [SystemMessage(
+        content=system_prompt)] + list(state.get('messages', []))
+    ai_msg = await llm.ainvoke(messages_to_send)
     ai_msg.content = "\n\n" + str(ai_msg.content)
 
     return {"step": "finish", "messages": [ai_msg]}
@@ -622,22 +655,20 @@ async def generate_summary_node(state: TravelState):
 async def check_weather_node(state: TravelState):
     """【天气节点】 真实调用 get_weather"""
     print("☀️ [Node] Checking Weather (Real Tool)...")
-    last_msg = state["messages"][-1].content
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     # 1. 提取城市名和日期
-    prompt = f"""
-    当前时间: {now_str}
-    用户输入: "{last_msg}"
-    
-    任务:
-    1. 提取城市名称，并转换为英文 (如 Beijing, Shanghai)。
-    2. 提取日期，并根据当前时间将相对日期 (如"明天", "下周五") 转换为 YYYY-MM-DD 格式。
-       - 如果用户未提及日期，date 字段留空。
-    """
+    system_prompt = f"""你是天气查询助手。当前时间: {now_str}
 
+任务:
+1. 提取城市名称，并转换为英文 (如 Beijing, Shanghai)。
+2. 提取日期，并根据当前时间将相对日期 (如"明天", "下周五") 转换为 YYYY-MM-DD 格式。
+   - 如果用户未提及日期，date 字段留空。"""
+
+    messages_to_send = [SystemMessage(
+        content=system_prompt)] + list(state.get('messages', []))
     structured = llm.with_structured_output(WeatherQuery)
-    q = await structured.ainvoke([HumanMessage(content=prompt)])
+    q = await structured.ainvoke(messages_to_send)
 
     loc = q.location or state.get("destination") or "Beijing"
     date_param = q.date
@@ -649,47 +680,36 @@ async def check_weather_node(state: TravelState):
         raw_report = f"无法获取天气: {e}"
 
     # 3. 格式化输出
-    format_prompt = f"""
-    你是一名贴心的旅行助手。请将以下原始天气数据转换为用户友好的 Markdown 格式。
-    
-    📍 地点: {loc}
-    📅 日期: {date_param if date_param else "近期预报"}
-    📝 原始数据: {raw_report}
-    
-    要求:
-    1. 使用 Emoji 图标 (☀️, 🌧️, 🌡️ 等) 增强可读性。
-    2. 提取关键信息：天气状况、最高/最低温。
-    3. 给出一条简短的穿衣或出行建议。
-    4. 格式示例:
-       ### 🌤️ {loc} 天气预报
-       - **日期**: 2025-11-25
-       - **天气**: 小雨 🌧️
-       - **温度**: 4°C - 12°C
-       > 💡 建议: 出门记得带伞，早晚温差大请注意保暖。
-    """
+    format_system = f"""你是一名贴心的旅行助手。请将以下原始天气数据转换为用户友好的 Markdown 格式。
 
-    formatted_msg = await llm.ainvoke([HumanMessage(content=format_prompt)])
+📍 地点: {loc}
+📅 日期: {date_param if date_param else "近期预报"}
+📝 原始数据: {raw_report}
+
+要求:
+1. 使用 Emoji 图标 (☀️, 🌧️, 🌡️ 等) 增强可读性。
+2. 提取关键信息：天气状况、最高/最低温。
+3. 给出一条简短的穿衣或出行建议。"""
+
+    formatted_msg = await llm.ainvoke([SystemMessage(content=format_system)])
 
     return {"messages": [formatted_msg]}
 
 
 async def side_chat_node(state: TravelState):
     print("💬 [Node] Side Chat (LLM)...")
-    last_msg = state["messages"][-1].content
     step = state.get("step", "unknown")
 
-    prompt = f"""
-    你是一个专业的旅行助手。
-    当前状态: {step}
-    用户输入: "{last_msg}"
-    
-    请根据用户输入进行回复：
-    1. 如果用户是在闲聊，请友好互动。
-    2. 如果用户有疑问，请解答。
-    3. 请保持回复简短自然。
-    """
+    system_prompt = f"""你是一个专业的旅行助手。当前状态: {step}
 
-    response = await llm.ainvoke([HumanMessage(content=prompt)])
+请根据用户输入进行回复：
+1. 如果用户是在闲聊，请友好互动。
+2. 如果用户有疑问，请解答。
+3. 请保持回复简短自然。"""
+
+    messages_to_send = [SystemMessage(
+        content=system_prompt)] + list(state.get('messages', []))
+    response = await llm.ainvoke(messages_to_send)
     return {"messages": [response]}
 
 
@@ -713,15 +733,63 @@ async def guide_node(state: TravelState):
 
     current_goal = goals.get(step, "引导用户进行下一步操作。")
 
-    prompt = f"""
-    当前主流程步骤: {step}
-    引导目标: {current_goal}
-    
-    任务: 生成一句简短、清晰的引导语 (20字以内)，明确告诉用户接下来该做什么。
-    不要重复之前的长篇大论，直接给行动指令。
-    """
-    res = await llm.with_structured_output(GuideOutput).ainvoke([HumanMessage(prompt)])
+    system_prompt = f"""当前主流程步骤: {step}
+引导目标: {current_goal}
+
+任务: 生成一句简短、清晰的引导语 (20字以内)，明确告诉用户接下来该做什么。
+不要重复之前的长篇大论，直接给行动指令。"""
+
+    messages_to_send = [SystemMessage(
+        content=system_prompt)] + list(state.get('messages', []))
+    res = await llm.with_structured_output(GuideOutput).ainvoke(messages_to_send)
     return {"messages": [AIMessage(f"\n\n💁 {res.guidance}")]}
+
+
+# --- 安全节点 ---
+
+
+async def sentinel_node(state: TravelState) -> dict:
+    """
+    【哨兵节点】
+    所有关键操作前的"看门人"，执行规则引擎评估。
+    """
+    current_step = state.get("step", "unknown")
+    print(f"🛡️ [Sentinel] 正在扫描 Step: {current_step}...")
+
+    # 调用规则引擎评估完整状态
+    result = evaluate_state(dict(state))
+
+    print(f"   => 评估结果: {result.action.value.upper()} | 原因: {result.reason}")
+
+    return {
+        "current_actor": "sentinel",
+        "action_type": result.action.value,
+        "risk_reason": result.reason
+    }
+
+
+async def block_node(state: TravelState) -> dict:
+    """
+    【拦截节点】
+    处理被规则引擎拦截的操作。
+    """
+    reason = state.get("risk_reason", "操作被系统拦截")
+
+    print(f"🛑 [Block] 操作被拦截: {reason}")
+
+    block_msg = f"""
+🛑 **操作已被拦截**
+
+原因: {reason}
+
+如有疑问，请联系客服或稍后重试。
+"""
+
+    return {
+        "step": "collect",  # 回退到信息收集阶段
+        "current_actor": "system",
+        "messages": [AIMessage(content=block_msg)]
+    }
 
 
 # --- 4. 构建图与路由逻辑 ---
@@ -744,6 +812,10 @@ workflow.add_node("summary", generate_summary_node)
 workflow.add_node("check_weather", check_weather_node)
 workflow.add_node("side_chat", side_chat_node)
 workflow.add_node("guide", guide_node)
+
+# --- 安全节点 ---
+workflow.add_node("sentinel", sentinel_node)
+workflow.add_node("block", block_node)
 
 workflow.add_edge(START, "intent_router")
 
@@ -776,11 +848,11 @@ def route_next_step(state: TravelState):
 
     # Flight Flow
     elif step == "search_flight":
-        return "search_flight"  # Should not happen if node returns select_flight, but for safety
+        return "search_flight"
     elif step == "select_flight":
         return "select_flight"
     elif step == "pay_flight":
-        return "pay_flight"
+        return "sentinel"  # 支付前先经过哨兵检查
 
     # Hotel Flow
     elif step == "search_hotel":
@@ -788,7 +860,7 @@ def route_next_step(state: TravelState):
     elif step == "select_hotel":
         return "select_hotel"
     elif step == "pay_hotel":
-        return "pay_hotel"
+        return "sentinel"  # 支付前先经过哨兵检查
 
     elif step == "summary":
         return "side_chat"
@@ -796,6 +868,24 @@ def route_next_step(state: TravelState):
         return "side_chat"
 
     return "side_chat"
+
+
+def route_after_sentinel(state: TravelState):
+    """哨兵节点后的路由逻辑"""
+    action = state.get("action_type", "pass")
+    step = state.get("step", "collect")
+
+    print(f"🛡️ [Sentinel Route] action={action}, step={step}")
+
+    if action == "block":
+        return "block"
+    # pass 或 review 都直接放行 (当前不启用人工审核)
+    else:
+        if step == "pay_flight":
+            return "pay_flight"
+        elif step == "pay_hotel":
+            return "pay_hotel"
+        return "guide"
 
 
 # 【核心字典映射】
@@ -810,7 +900,21 @@ workflow.add_conditional_edges("intent_router", route_next_step, {
     "pay_hotel": "pay_hotel",
     "side_chat": "side_chat",
     "check_weather": "check_weather",
+    "sentinel": "sentinel",
+    "block": "block",
+    "guide": "guide",
 })
+
+# 哨兵节点后的条件路由
+workflow.add_conditional_edges("sentinel", route_after_sentinel, {
+    "block": "block",
+    "pay_flight": "pay_flight",
+    "pay_hotel": "pay_hotel",
+    "guide": "guide",
+})
+
+# 拦截节点后返回引导
+workflow.add_edge("block", "guide")
 
 # 后置连接逻辑
 workflow.add_conditional_edges("collect", lambda s: "plan" if s.get(

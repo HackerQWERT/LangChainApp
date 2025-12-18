@@ -32,9 +32,9 @@ dependencies = [
     "langchain-google-vertexai>=0.0.1",
     "tavily-python>=0.7.14",
     "langsmith>=0.3.45",
-    "google-search-results>=2.4.2",
     "airportsdata>=20250909",
     "ragas>=0.1.0",
+    "google-search-results>=2.4.2",
 ]
 
 [dependency-groups]

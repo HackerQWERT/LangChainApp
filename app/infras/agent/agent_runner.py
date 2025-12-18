@@ -80,6 +80,227 @@ async def run_chat_stream(agent_graph, user_input: str, user_id: str = "default_
     print("\n" + "-" * 60)
 
 
+async def run_monitor_stream(
+    agent_graph,
+    user_input: str,
+    user_id: str = "default_user",
+    verbose: bool = False,
+    show_summary: bool = True
+):
+    """
+    性能监控专用 Runner。
+    使用 astream_events API 实现更可靠的节点级别监控。
+
+    Args:
+        agent_graph: 编译好的 LangGraph 对象
+        user_input: 用户输入的文本
+        user_id: 线程 ID，用于记忆功能
+        verbose: 是否开启详细模式 (DEBUG 级别日志)
+        show_summary: 是否在结束后打印摘要报告
+    """
+    from app.infras.evaluate.evaluate_agent import (
+        AgentPerformanceMonitor, LogLevel, NodeExecution, NodeOutput
+    )
+    import time
+
+    print(f"\n🔵 [Monitor] User({user_id}): {user_input}")
+    print("🚀 [Monitor] Agent Workflow Started")
+
+    # 创建监控器 (但主要通过 astream_events 收集数据)
+    monitor = AgentPerformanceMonitor(
+        log_level=LogLevel.DEBUG if verbose else LogLevel.INFO,
+        show_tool_io=True,
+        show_router_decisions=True,
+        session_id=user_id
+    )
+    monitor.trace.user_input = user_input
+    monitor.trace.start_time = time.time()
+
+    # 构造配置
+    config = {
+        "configurable": {"thread_id": user_id},
+        "callbacks": [monitor]  # 仍然保留 callback 用于 LLM/Tool 监控
+    }
+
+    # 已知节点列表
+    KNOWN_NODES = {
+        "intent_router", "collect", "plan", "search_flight", "select_flight",
+        "pay_flight", "search_hotel", "select_hotel", "pay_hotel",
+        "summary", "check_weather", "side_chat", "guide"
+    }
+
+    # 节点图标映射
+    NODE_ICONS = {
+        "collect": "📋", "intent_router": "🚦", "plan": "📝",
+        "search_flight": "✈️", "search_hotel": "🏨",
+        "select_flight": "🎫", "select_hotel": "🛏️",
+        "pay_flight": "💳", "pay_hotel": "💰",
+        "check_weather": "🌤️", "summary": "📊",
+        "side_chat": "💬", "guide": "🗺️"
+    }
+
+    # 节点执行追踪
+    node_start_times = {}
+    final_response = None
+    all_messages = []  # 收集所有消息用于确定最终回复
+
+    try:
+        inputs = {"messages": [HumanMessage(content=user_input)]}
+
+        async for event in agent_graph.astream_events(inputs, version="v2", config=config):
+            kind = event["event"]
+            node_name = event.get("name", "")
+
+            # === 调试模式: 打印所有事件 ===
+            if verbose and kind not in ["on_chat_model_stream"]:
+                print(f"   [DEBUG] Event: {kind} | Name: {node_name}")
+
+            # === 节点开始 ===
+            if kind == "on_chain_start" and node_name in KNOWN_NODES:
+                node_start_times[node_name] = time.time()
+                icon = NODE_ICONS.get(node_name, "📍")
+                print(f"{icon} [Node] Entering: {node_name}")
+
+                # 记录到 trace
+                node_exec = NodeExecution(
+                    name=node_name,
+                    start_time=node_start_times[node_name]
+                )
+                monitor.trace.nodes.append(node_exec)
+
+            # === 节点结束 (关键: 捕获输出) ===
+            elif kind == "on_chain_end" and node_name in KNOWN_NODES:
+                duration = time.time() - node_start_times.get(node_name, time.time())
+                icon = NODE_ICONS.get(node_name, "📍")
+                print(f"   ✅ [{node_name}] Completed in {duration:.2f}s")
+
+                # 更新节点记录
+                for node in reversed(monitor.trace.nodes):
+                    if node.name == node_name and node.end_time is None:
+                        node.end_time = time.time()
+                        node.duration = duration
+                        node.status = "completed"
+                        break
+
+                # 提取节点输出
+                output = event["data"].get("output")
+                if output and isinstance(output, dict):
+                    node_output = NodeOutput(
+                        node_name=node_name,
+                        timestamp=time.time()
+                    )
+
+                    has_content = False
+
+                    # 提取消息内容 (多种格式兼容)
+                    if "messages" in output and output["messages"]:
+                        msgs = output["messages"]
+                        last_msg = msgs[-1]
+
+                        # 尝试多种方式提取内容
+                        content = None
+                        if hasattr(last_msg, "content"):
+                            content = last_msg.content
+                        elif isinstance(last_msg, dict):
+                            content = last_msg.get("content", "")
+
+                        if content:
+                            has_content = True
+                            node_output.message_content = content
+                            final_response = content  # 更新最终回复
+                            # 显示输出预览
+                            preview = content[:150] + \
+                                "..." if len(content) > 150 else content
+                            print(f"   💬 [Output] {preview}")
+
+                            # 更新节点记录
+                            for node in reversed(monitor.trace.nodes):
+                                if node.name == node_name:
+                                    node.output_message = preview
+                                    break
+
+                    # 提取方案
+                    if "generated_plans" in output:
+                        has_content = True
+                        node_output.plans = output["generated_plans"]
+                        print(
+                            f"   📋 [Plans] {len(output['generated_plans'])} options generated")
+
+                    # 提取搜索选项
+                    if "realtime_options" in output:
+                        has_content = True
+                        options = output["realtime_options"]
+                        node_output.options = options
+                        for key, val in options.items():
+                            if isinstance(val, list) and val:
+                                print(f"   🔍 [{key}] {len(val)} results found")
+
+                    # 提取状态更新
+                    state_keys = ["step", "destination", "origin", "dates"]
+                    state_updates = {
+                        k: output[k] for k in state_keys if k in output and output[k]}
+                    if state_updates:
+                        node_output.state_updates = state_updates
+                        print(f"   🔄 [State] {state_updates}")
+
+                    # 始终记录节点输出 (即使为空，也方便调试)
+                    monitor.trace.node_outputs.append(node_output)
+
+                    # 调试: 如果节点没有捕获到内容，打印原始输出帮助诊断
+                    if not has_content and verbose:
+                        print(
+                            f"   ⚠️ [Debug] Raw output keys: {list(output.keys())}")
+
+            # === LangGraph 图完成事件 (用于捕获最终状态) ===
+            elif kind == "on_chain_end" and node_name == "LangGraph":
+                output = event["data"].get("output")
+                if output and isinstance(output, dict) and "messages" in output:
+                    msgs = output["messages"]
+                    if msgs:
+                        # 获取最后一条消息作为最终回复
+                        last_msg = msgs[-1]
+                        content = getattr(last_msg, "content", None) or (
+                            last_msg.get("content", "") if isinstance(
+                                last_msg, dict) else ""
+                        )
+                        if content:
+                            final_response = content
+                            all_messages.append(content)
+                            if verbose:
+                                print(
+                                    f"   [DEBUG] LangGraph final message captured")
+
+        # 更新追踪状态
+        monitor.trace.status = "completed"
+        monitor.trace.final_response = final_response
+
+        if final_response:
+            print(f"\n🟢 最终回复: {final_response}")
+        else:
+            # 尝试从最后一个有内容的节点输出中获取
+            for node_out in reversed(monitor.trace.node_outputs):
+                if node_out.message_content:
+                    final_response = node_out.message_content
+                    monitor.trace.final_response = final_response
+                    print(f"\n🟢 最终回复: {final_response}")
+                    break
+            else:
+                print(f"\n⚠️ 未捕获到最终回复")
+
+    except Exception as e:
+        monitor.trace.status = "error"
+        monitor.trace.error = str(e)
+        print(f"\n❌ 运行错误: {e}")
+
+    # 打印详细摘要
+    if show_summary:
+        monitor.print_summary(detailed=True)
+
+    print("\n" + "-" * 60)
+
+    return monitor  # 返回监控器实例，方便进一步分析
+
+
 async def sse_chat_stream(agent_graph, input_payload: dict, config: dict):
     """
     SSE (Server-Sent Events) 生成器。
@@ -101,7 +322,7 @@ async def sse_chat_stream(agent_graph, input_payload: dict, config: dict):
     # 这些节点的 LLM 输出是纯文本，适合直接打字机展示
     # 注意: 如果节点使用 invoke/ainvoke 而非 stream，则不会触发 on_chat_model_stream
     # 为了稳定性，暂时关闭流式，统一使用 on_chain_end 输出
-    ALLOW_STREAMING_NODES = set() 
+    ALLOW_STREAMING_NODES = set()
 
     try:
         # 监听 LangGraph 的细粒度事件
@@ -167,6 +388,14 @@ async def sse_chat_stream(agent_graph, input_payload: dict, config: dict):
                     if msgs := output.get("messages"):
                         content = msgs[-1].content
                         if content:
+                            yield create_event("message", {"content": content, "is_stream": False})
+
+                # === 策略 E: 拦截节点 ===
+                elif node_name == "block":
+                    if msgs := output.get("messages"):
+                        content = msgs[-1].content
+                        if content:
+                            yield create_event("control", {"type": "blocked", "reason": output.get("risk_reason", "操作被拦截")})
                             yield create_event("message", {"content": content, "is_stream": False})
 
     except Exception as e:
