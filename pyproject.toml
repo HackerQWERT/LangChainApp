@@ -48,5 +48,6 @@ dev = [
 pythonpath = "."
 testpaths = ["tests"]
 addopts = "-s"
+asyncio_mode = "auto"
 log_cli = true
 log_level = "DEBUG"
